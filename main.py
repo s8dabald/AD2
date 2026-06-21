@@ -16,7 +16,7 @@ def test_logger(header, results):
     ws.append([header])
     for result_str in results:
         ws.append([result_str])
-    ws.append(["=" * 80])  # separator line
+    ws.append(["'" + "=" * 80])  # separator line
     
     wb.save("test_results.xlsx")
     print("Results saved to test_results.xlsx")
@@ -38,15 +38,14 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved= True, str
 
         # Get uncertain samples (DataFrame with posting_id column), excluding already corrected
         uncertain_df = uncertainty_query(df, strategy, exclude_posting_ids=corrected)
-        misspredicted=0
-        # Replace pred_label with true label for uncertain samples
-        for posting_id in uncertain_df['posting_id']:
-            true_label = df.loc[df['posting_id'] == posting_id, 'label'].values[0]
-            if true_label != df.loc[df['posting_id'] == posting_id, 'pred_label'].values[0]:
-                misspredicted += 1
-            df = replace_posting(df, posting_id, true_label)
-            if corrected_saved:
-                corrected.append(posting_id) #save posting_id of corrected samples to exclude them in next iteration
+        
+        # Vectorized: Replace pred_label with true label for all uncertain samples at once
+        mask = df['posting_id'].isin(uncertain_df['posting_id'])
+        misspredicted = (df.loc[mask, 'label'] != df.loc[mask, 'pred_label']).sum()
+        df.loc[mask, 'pred_label'] = df.loc[mask, 'label']
+        
+        if corrected_saved:
+            corrected.extend(uncertain_df['posting_id'].tolist())
 
         # Retrain CatBoost on updated labels
         df, cat_importances, precision, recall, cat_model, tn, fp, fn, tp = train_catboost(df, corrected_ids=corrected, corrected_weights=corrected_weights)
@@ -75,14 +74,12 @@ def incremental_catboost(df, l=10, return_full_data=False):
             break
         
         counter += 1
-        misspredicted = 0
-        # Replace labels for uncertain samples
-        for posting_id in uncertain_df['posting_id']:
-            true_label = df.loc[df['posting_id'] == posting_id, 'label'].values[0]
-            if true_label != df.loc[df['posting_id'] == posting_id, 'pred_label'].values[0]:
-                misspredicted += 1
-            df = replace_posting(df, posting_id, true_label)
-            corrected.append(posting_id)
+        
+        # Vectorized: Replace labels for all uncertain samples at once
+        mask = df['posting_id'].isin(uncertain_df['posting_id'])
+        misspredicted = (df.loc[mask, 'label'] != df.loc[mask, 'pred_label']).sum()
+        df.loc[mask, 'pred_label'] = df.loc[mask, 'label']
+        corrected.extend(uncertain_df['posting_id'].tolist())
         
         # Get the updated uncertain_df from df
         uncertain_df_updated = df[df['posting_id'].isin(uncertain_df['posting_id'])].copy()
@@ -109,7 +106,7 @@ def replace_posting(df, posting_id, replacement):
 
 def run_unsupervised():
     df, labels = full_dataprep()
-    df_if = run_if(df, labels, verbose=True)
+    df_if = run_if(df, labels, verbose=False)
     df_cat, cat_importances, precision, recall, cat_model,tn, fp, fn, tp = train_catboost(df_if, verbose=True)
     print(f"\nInitial Precision: {precision:.4f}, Initial Recall: {recall:.4f}")
     return df_cat, cat_importances, precision, recall, cat_model
@@ -126,3 +123,7 @@ def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corre
 if __name__ == "__main__":
     
     df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False)
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=50, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False)
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False)
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="novelty", return_full_data=False)
+    
