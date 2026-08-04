@@ -1,8 +1,11 @@
+from datetime import datetime
+
 from dataprep import full_dataprep
 import pandas as pd
 from isolation_forest import run_if
 from models.kittyboost import train_catboost
 from querystep import uncertainty_query
+from greedy import greedy_iteration
 from openpyxl import Workbook, load_workbook
 
 def test_logger(header, results):
@@ -21,14 +24,18 @@ def test_logger(header, results):
     wb.save("test_results.xlsx")
     print("Results saved to test_results.xlsx")
 
-def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved= True, strategy="entropy"):
+def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved= True, strategy="entropy", greedy_batching=False, greedy_T=None):
     """Retrain CatBoost iteratively by correcting uncertain samples based on the specified strategy.
     Args:
         df (pd.DataFrame): Input DataFrame containing 'label', 'pred_label', and 'posting_id' columns.
         l (int): Number of iterations for retraining.
         corrected_weights (int): Weight to assign to corrected samples during training.
         corrected_saved (bool): Whether to save the posting_ids of corrected samples to exclude them in future iterations.
-        strategy (str): Strategy for selecting uncertain samples ('entropy', 'margin', 'least_confidence')."""
+        strategy (str): Strategy for selecting uncertain samples ('entropy', 'margin', 'least_confidence').
+        greedy_batching (bool): Use greedy cluster correction (Voronoi partition + propagation).
+        greedy_T (float): Fixed cluster radius for greedy batching (None -> estimated)."""
+    if greedy_batching:
+        return greedy_retrain_catboost(df, l=l, corrected_weights=corrected_weights, strategy=strategy, T=greedy_T)
     corrected = []
     results = []
     target_iters = {1, l//2 + 1, l}
@@ -54,6 +61,46 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved= True, str
         
         if (i+1) in target_iters:
             results.append(f"Iteration: {i+1}, Precision: {precision:.4f}, Recall: {recall:.4f}, TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
+
+    return df, cat_importances, precision, recall, results
+
+def greedy_retrain_catboost(df, l=10, corrected_weights=100, strategy="entropy", T=None):
+    """Greedy Cluster Correction: wählt pro Iteration den most uncertain Case,
+    reviewed ihn, und propagiert sein Label via globaler Voronoi-Partition auf alle
+    gecoverten Cases (innerhalb des Radius T). Re-Selection mit Labeländerung splittet
+    das Cluster (Bisektrix). Logging inkl. Propagation-Accuracy als Diagnose."""
+    state = {
+        "centers": {},
+        "directly_corrected": set(),
+        "covered": set(),
+        "region_of": {},
+        "T": T,
+    }
+    results = []
+    target_iters = {1, l//2 + 1, l}
+    cat_importances = None
+    precision = recall = 0.0
+
+    for i in range(l):
+        print(f"\n=== Greedy Iteration {i+1} ===")
+        df, state, meta = greedy_iteration(df, strategy, state)
+        if meta.get("type") == "no_candidates":
+            print("No more candidates in pool.")
+            break
+
+        corrected_ids = list(state["directly_corrected"] | state["covered"])
+        df, cat_importances, precision, recall, cat_model, tn, fp, fn, tp = train_catboost(
+            df, corrected_ids=corrected_ids, corrected_weights=corrected_weights
+        )
+        print(f"Precision: {precision:.4f}, Recall: {recall:.4f} | "
+              f"type={meta.get('type')}, centers={meta.get('n_centers')}, "
+              f"covered={meta.get('n_covered')}, flipped={meta.get('n_flipped')}")
+
+        if (i+1) in target_iters:
+            extra = (f", type={meta.get('type')}, centers={meta.get('n_centers')}, "
+                     f"covered={meta.get('n_covered')}, cum_direct={meta.get('cumulative_direct')}, "
+                     f"flipped={meta.get('n_flipped')}, prop_acc={meta.get('propagation_accuracy'):.4f}, T={state['T']:.4f}")
+            results.append(f"Iteration: {i+1}, Precision: {precision:.4f}, Recall: {recall:.4f}, TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}{extra}")
 
     return df, cat_importances, precision, recall, results
 
@@ -111,19 +158,17 @@ def run_unsupervised():
     print(f"\nInitial Precision: {precision:.4f}, Initial Recall: {recall:.4f}")
     return df_cat, cat_importances, precision, recall, cat_model
 
-def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False):
+def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False, greedy_batching=False, greedy_T=None):
     df, cat_importances, precision, recall, cat_model = run_unsupervised()
     if training_strat == 'incremental':
         df, cat_importances, precision, recall, cat_model, results = incremental_catboost(df, l, return_full_data)
     else:
-        df, cat_importances, precision, recall, results = retrain_catboost(df, l,corrected_weights, corrected_saved, strategy)
-    test_logger(f"training_strat= {training_strat}, l={l}, corrected_weights = {corrected_weights}, corrected_saved = {corrected_saved}, strategy = {strategy}", results)
+        df, cat_importances, precision, recall, results = retrain_catboost(df, l,corrected_weights, corrected_saved, strategy, greedy_batching=greedy_batching, greedy_T=greedy_T)
+    test_logger(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] | training_strat= {training_strat}, l={l}, corrected_weights = {corrected_weights}, corrected_saved = {corrected_saved}, strategy = {strategy}, greedy_batching = {greedy_batching}", results)
     return df, cat_importances, precision, recall, cat_model
 
 if __name__ == "__main__":
-    
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False)
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=50, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False)
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False)
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="novelty", return_full_data=False)
+
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=50, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False, greedy_batching=True)
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=50, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True)
     
