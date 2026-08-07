@@ -8,14 +8,49 @@ def get_feature_cols(df):
     return df.drop(columns=["label", "posting_id", "pred_label", "pred_score"]).columns.tolist()
 
 
-def estimate_threshold(df, feature_cols, k=10, sample_size=5000, random_state=42):
-    """T_init: Median der mittleren k-NN-Distanzen im gescalten Feature-Space."""
+def new_state(T=None):
+    """State für den Greedy-Loop inkl. Proximity-Caches.
+
+    caches:
+        scaler       : StandardScaler, gefittet auf dem vollen Feature-Space (1x)
+        X_scaled     : skaliertes Feature-Array (1x, statisch)
+        X_ids        : posting_id-Array (1x, statisch)
+        dist_cache   : {center_id -> Distanzvektor aller Cases zu diesem Center}
+        nearest      : argmin-Partition aus dem letzten Re-Partition (Reuse bei skip)
+        covered_arr  : covered-Bool-Array aus dem letzten Re-Partition
+        novelty_scores : statische Novelty-Scores (1x)
+    """
+    return {
+        "centers": {},
+        "directly_corrected": set(),
+        "covered": set(),
+        "region_of": {},
+        "T": T,
+        "scaler": None,
+        "X_scaled": None,
+        "X_ids": None,
+        "dist_cache": {},
+        "nearest": None,
+        "covered_arr": None,
+        "novelty_scores": None,
+    }
+
+
+def estimate_threshold(df, feature_cols, scaler=None, k=10, sample_size=5000, random_state=42):
+    """T_init: Median der mittleren k-NN-Distanzen im gescalten Feature-Space.
+
+    Nutzt den (vollen) scaler, falls übergeben, sonst eigenen Fit.
+    Deterministisch via RandomState(seed) und stabilem Feature-Space.
+    """
     X = df[feature_cols].values
     if sample_size is not None and len(X) > sample_size:
         rng = np.random.RandomState(random_state)
         idx = rng.choice(len(X), size=sample_size, replace=False)
         X = X[idx]
-    X_scaled = StandardScaler().fit_transform(X)
+    if scaler is not None:
+        X_scaled = scaler.transform(X)
+    else:
+        X_scaled = StandardScaler().fit_transform(X)
     nn = NearestNeighbors(n_neighbors=min(k + 1, len(X)), metric="euclidean", n_jobs=-1)
     nn.fit(X_scaled)
     distances, _ = nn.kneighbors(X_scaled)
@@ -23,29 +58,35 @@ def estimate_threshold(df, feature_cols, k=10, sample_size=5000, random_state=42
     return float(np.median(knn_dists))
 
 
-def global_partition(df, centers, feature_cols, T):
-    """Globales Voronoi: jeder Case -> nächstgelegenes Center. Gecovert, wenn innerhalb T.
-    Returns: nearest (int array, Center-Index je Row), covered (bool array)."""
-    X_scaled = StandardScaler().fit_transform(df[feature_cols].values)
-    ids = df["posting_id"].values
-    center_ids = list(centers.keys())
-    center_idx = [np.where(ids == c)[0][0] for c in center_ids]
-    C = X_scaled[center_idx]
+def _ensure_features(df, state, feature_cols):
+    if state["scaler"] is None:
+        state["scaler"] = StandardScaler().fit(df[feature_cols].values)
+    if state["X_scaled"] is None:
+        state["X_scaled"] = state["scaler"].transform(df[feature_cols].values)
+    if state["X_ids"] is None:
+        state["X_ids"] = df["posting_id"].values
 
-    n = len(df)
-    k = len(center_ids)
-    dists = np.empty((n, k))
-    for j in range(k):
-        diff = X_scaled - C[j]
-        dists[:, j] = np.sqrt((diff ** 2).sum(axis=1))
 
-    nearest = dists.argmin(axis=1)
-    nearest_dist = dists[np.arange(n), nearest]
-    covered = nearest_dist <= T
+def center_distances(state, center_id):
+    """Distanzvektor aller Cases zum Center (via cached X_scaled)."""
+    center_idx = np.where(state["X_ids"] == center_id)[0][0]
+    diff = state["X_scaled"] - state["X_scaled"][center_idx]
+    return np.sqrt((diff ** 2).sum(axis=1))
+
+
+def _partition_from_cache(df, state):
+    """Voronoi-Partition über die Distanz-Caches der aktuellen Center."""
+    center_ids = list(state["centers"].keys())
+    dist_matrix = np.column_stack([state["dist_cache"][c] for c in center_ids])
+    nearest = dist_matrix.argmin(axis=1)
+    nearest_dist = dist_matrix[np.arange(len(df)), nearest]
+    covered = nearest_dist <= state["T"]
+    state["nearest"] = nearest
+    state["covered_arr"] = covered
     return nearest, covered
 
 
-def _uncertainty_scores(df, strategy):
+def _uncertainty_scores(df, strategy, state):
     if strategy == "margin":
         df = margin_uncertainty(df, df["pred_score"])
         return df, "margin_uncertainty"
@@ -53,7 +94,11 @@ def _uncertainty_scores(df, strategy):
         df = entropy_uncertainty(df, df["pred_score"])
         return df, "entropy_uncertainty"
     elif strategy == "novelty":
-        df = novelty_uncertainty(df)
+        if state["novelty_scores"] is None:
+            df = novelty_uncertainty(df)
+            state["novelty_scores"] = df["novelty_uncertainty"].values.copy()
+        else:
+            df["novelty_uncertainty"] = state["novelty_scores"]
         return df, "novelty_uncertainty"
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
@@ -63,22 +108,19 @@ def greedy_iteration(df, strategy, state):
     """Eine greedy Iteration: Selektion des most uncertain Case M, Oracle-Review,
     ggf. neues Center (Split/neues Territorium), globaler Re-Partition, Propagation.
 
-    state: dict mit
-        centers            : {posting_id -> label}
-        directly_corrected : set
-        covered            : set (monoton wachsend)
-        region_of          : {posting_id -> center posting_id}
-        T                  : Cluster-Radius (None -> wird geschätzt)
+    state: dict via new_state(T); Caches werden befüllt und bei skip- Iterationen
+    wiederverwendet (Re-Partition nur bei new_center/split).
 
     Returns: (df_updated, state_updated, meta)
     """
     meta = {}
+    feature_cols = get_feature_cols(df)
 
+    _ensure_features(df, state, feature_cols)
     if state["T"] is None:
-        feature_cols = get_feature_cols(df)
-        state["T"] = estimate_threshold(df, feature_cols)
+        state["T"] = estimate_threshold(df, feature_cols, scaler=state["scaler"])
 
-    df, score_col = _uncertainty_scores(df, strategy)
+    df, score_col = _uncertainty_scores(df, strategy, state)
     pool_mask = ~df["posting_id"].isin(state["directly_corrected"])
     pool = df[pool_mask]
     if pool.empty:
@@ -106,10 +148,16 @@ def greedy_iteration(df, strategy, state):
             meta["type"] = "split"
             meta["split_from"] = cur_center
 
-    feature_cols = get_feature_cols(df)
-    nearest, covered = global_partition(df, state["centers"], feature_cols, state["T"])
+    if meta["type"] in ("new_center", "split"):
+        state["dist_cache"][M] = center_distances(state, M)
+        nearest, covered = _partition_from_cache(df, state)
+    else:
+        if state["nearest"] is None:
+            nearest, covered = _partition_from_cache(df, state)
+        else:
+            nearest, covered = state["nearest"], state["covered_arr"]
 
-    ids = df["posting_id"].values
+    ids = state["X_ids"]
     center_ids = list(state["centers"].keys())
     center_labels = np.array([state["centers"][c] for c in center_ids])
 

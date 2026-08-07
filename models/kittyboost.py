@@ -4,7 +4,7 @@ import numpy as np
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, classification_report
 
 
-def train_catboost(df, verbose = False, incremental = False, inc_model = None, full_data = None, corrected_ids = None,corrected_weights=100):
+def train_catboost(df, verbose = False, incremental = False, inc_model = None, full_data = None, corrected_ids = None,corrected_weights=100, compute_shap=False):
     
     if corrected_ids is not None:
         weights = np.ones(len(df))
@@ -71,7 +71,8 @@ def train_catboost(df, verbose = False, incremental = False, inc_model = None, f
 
     df_pred = (preds > best_t).astype(int)
 
-    shap_vals = model.get_feature_importance(train_pool, type="ShapValues")
+    if verbose or compute_shap:
+        shap_vals = model.get_feature_importance(train_pool, type="ShapValues")
 
     if verbose:
         print("=== CATBOOST (Trainiert auf generated_label, evaluiert auf true label) ===")

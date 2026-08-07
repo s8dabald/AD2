@@ -14,10 +14,10 @@ def entropy_uncertainty(df, proba):
     df['entropy_uncertainty'] = uncertainty_entropy
     return df
 
-def novelty_uncertainty(df):
+def novelty_scores(df):
     from sklearn.preprocessing import StandardScaler
     from sklearn.neighbors import NearestNeighbors
-    X = df.drop(columns=["label", "posting_id", "pred_label", "pred_score"] )
+    X = df.drop(columns=["label", "posting_id", "pred_label", "pred_score"])
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
@@ -29,10 +29,13 @@ def novelty_uncertainty(df):
     # Remove self-neighbor
     novelty_raw = distances[:, 1:].mean(axis=1)
     novelty = (novelty_raw - novelty_raw.min()) / (novelty_raw.max() - novelty_raw.min() + 1e-12)
-    df['novelty_uncertainty'] = novelty
+    return novelty
+
+def novelty_uncertainty(df):
+    df['novelty_uncertainty'] = novelty_scores(df)
     return df
 
-def uncertainty_query(df, strategy = "margin", exclude_posting_ids=None):
+def uncertainty_query(df, strategy = "margin", exclude_posting_ids=None, novelty_scores=None):
     if exclude_posting_ids is None:
         exclude_posting_ids = []
     if strategy == "margin":
@@ -46,7 +49,10 @@ def uncertainty_query(df, strategy = "margin", exclude_posting_ids=None):
         filtered = filtered.sort_values("entropy_uncertainty", ascending=False).head(10)
         return filtered.drop(columns=["entropy_uncertainty"])
     elif strategy == "novelty":
-        df = novelty_uncertainty(df)
+        if novelty_scores is None:
+            df = novelty_uncertainty(df)
+        else:
+            df["novelty_uncertainty"] = novelty_scores
         filtered = df[~df['posting_id'].isin(exclude_posting_ids)]
         filtered = filtered.sort_values("novelty_uncertainty", ascending=False).head(10)
         return filtered.drop(columns=["novelty_uncertainty"])
