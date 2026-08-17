@@ -3,22 +3,46 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 from querystep import margin_uncertainty, entropy_uncertainty, novelty_uncertainty
 
+# Flag-based features: rule checks (promptly, weekend, nwh, top_n, high_cash).
+# These are excluded when using features_raw.
+FLAG_PREFIXES = ("promptly_", "weekend_", "nwh_", "top_n_", "high_cash_")
+
 
 def get_feature_cols(df):
+    """All model feature columns (everything except label, posting_id, pred_label, pred_score)."""
     return df.drop(columns=["label", "posting_id", "pred_label", "pred_score"]).columns.tolist()
 
 
-def new_state(T=None):
-    """State für den Greedy-Loop inkl. Proximity-Caches.
+def _get_feature_groups(df):
+    """Split feature columns into raw (values) and flags (rule checks).
+    features_all = features_raw + features_flags = all 119 features."""
+    all_features = get_feature_cols(df)
+    raw = [f for f in all_features if not any(f.startswith(p) for p in FLAG_PREFIXES)]
+    flags = [f for f in all_features if any(f.startswith(p) for p in FLAG_PREFIXES)]
+    return {"features_all": all_features, "features_raw": raw, "features_flags": flags}
 
-    caches:
-        scaler       : StandardScaler, gefittet auf dem vollen Feature-Space (1x)
-        X_scaled     : skaliertes Feature-Array (1x, statisch)
-        X_ids        : posting_id-Array (1x, statisch)
-        dist_cache   : {center_id -> Distanzvektor aller Cases zu diesem Center}
-        nearest      : argmin-Partition aus dem letzten Re-Partition (Reuse bei skip)
-        covered_arr  : covered-Bool-Array aus dem letzten Re-Partition
-        novelty_scores : statische Novelty-Scores (1x)
+
+def new_state(T=None, propagation_space=None):
+    """State for the greedy loop, including propagation caches.
+
+    Caches:
+        T                : cluster radius (None = auto-estimate)
+        centers          : {posting_id -> label}
+        directly_corrected : set of reviewed posting_ids
+        covered          : set (monotonically growing)
+        region_of        : {posting_id -> center posting_id}
+        X_ids            : posting_id array (1x, static)
+        dist_cache       : {center_id -> distance vector for all cases}
+        nearest          : argmin partition from last re-partition (reuse on skip)
+        covered_arr      : covered bool array from last re-partition
+        novelty_scores   : novelty scores (1x)
+        propagation_space : list of space keys, e.g. ["features_all"] or ["shap_all"]
+        prop_scaled      : scaled feature matrix for features_all (1x)
+        prop_raw_scaled  : scaled feature matrix for features_raw (1x)
+        prop_flags_scaled : scaled feature matrix for features_flags (1x)
+        shap_vals        : SHAP array (N, n_features), set once after each retrain
+        shap_raw_indices : column indices for shap_raw (1x)
+        shap_flag_indices : column indices for shap_flags (1x)
     """
     return {
         "centers": {},
@@ -26,60 +50,109 @@ def new_state(T=None):
         "covered": set(),
         "region_of": {},
         "T": T,
-        "scaler": None,
-        "X_scaled": None,
         "X_ids": None,
         "dist_cache": {},
         "nearest": None,
         "covered_arr": None,
         "novelty_scores": None,
+        # propagation
+        "propagation_space": propagation_space or ["features_all"],
+        "prop_scaled": None,
+        "prop_raw_scaled": None,
+        "prop_flags_scaled": None,
+        "shap_vals": None,
+        "shap_raw_indices": None,
+        "shap_flag_indices": None,
     }
 
 
-def estimate_threshold(df, feature_cols, scaler=None, k=10, sample_size=5000, random_state=42):
-    """T_init: Median der mittleren k-NN-Distanzen im gescalten Feature-Space.
+def _ensure_propagation(df, state):
+    """Scale feature groups and compute SHAP indices. Everything is cached (1x)."""
+    groups = _get_feature_groups(df)
+    ps = state["propagation_space"]
+    n = len(df)
 
-    Nutzt den (vollen) scaler, falls übergeben, sonst eigenen Fit.
-    Deterministisch via RandomState(seed) und stabilem Feature-Space.
-    """
-    X = df[feature_cols].values
-    if sample_size is not None and len(X) > sample_size:
+    # Scale feature groups on first call, then reuse
+    if "features_all" in ps and state["prop_scaled"] is None:
+        state["prop_scaled"] = StandardScaler().fit_transform(df[groups["features_all"]].values)
+    if "features_raw" in ps and state["prop_raw_scaled"] is None:
+        state["prop_raw_scaled"] = StandardScaler().fit_transform(df[groups["features_raw"]].values)
+    if "features_flags" in ps and state["prop_flags_scaled"] is None:
+        state["prop_flags_scaled"] = StandardScaler().fit_transform(df[groups["features_flags"]].values)
+
+    if state["X_ids"] is None:
+        state["X_ids"] = df["posting_id"].values
+
+    # Compute SHAP column indices once (mapping from feature_cols order to SHAP columns)
+    if state["shap_raw_indices"] is None and any(s.startswith("shap") for s in ps):
+        all_features = groups["features_all"]
+        state["shap_raw_indices"] = [i for i, f in enumerate(all_features)
+                                     if not any(f.startswith(p) for p in FLAG_PREFIXES)]
+        state["shap_flag_indices"] = [i for i, f in enumerate(all_features)
+                                      if any(f.startswith(p) for p in FLAG_PREFIXES)]
+
+
+def _build_propagation_matrix(state):
+    """Build the combined matrix for distance computation based on propagation_space.
+    Feature parts are already scaled, SHAP parts are used as-is (comparable scale)."""
+    parts = []
+    ps = state["propagation_space"]
+
+    if "features_all" in ps and state["prop_scaled"] is not None:
+        parts.append(state["prop_scaled"])
+    if "features_raw" in ps and state["prop_raw_scaled"] is not None:
+        parts.append(state["prop_raw_scaled"])
+    if "features_flags" in ps and state["prop_flags_scaled"] is not None:
+        parts.append(state["prop_flags_scaled"])
+
+    if state["shap_vals"] is not None:
+        if "shap_all" in ps:
+            parts.append(state["shap_vals"])
+        if "shap_raw" in ps and state["shap_raw_indices"] is not None:
+            parts.append(state["shap_vals"][:, state["shap_raw_indices"]])
+        if "shap_flags" in ps and state["shap_flag_indices"] is not None:
+            parts.append(state["shap_vals"][:, state["shap_flag_indices"]])
+
+    if not parts:
+        raise ValueError("propagation_space produced empty matrix — check your config")
+    return np.hstack(parts)
+
+
+def _prop_dims(state):
+    """Number of dimensions in the current propagation matrix (for logging)."""
+    mat = _build_propagation_matrix(state)
+    return mat.shape[1]
+
+
+def estimate_threshold(state, k=10, sample_size=5000, random_state=42):
+    """Estimate cluster radius T as median of mean k-NN distances in propagation space.
+    Deterministic via RandomState(seed)."""
+    mat = _build_propagation_matrix(state)
+    if sample_size is not None and len(mat) > sample_size:
         rng = np.random.RandomState(random_state)
-        idx = rng.choice(len(X), size=sample_size, replace=False)
-        X = X[idx]
-    if scaler is not None:
-        X_scaled = scaler.transform(X)
-    else:
-        X_scaled = StandardScaler().fit_transform(X)
-    nn = NearestNeighbors(n_neighbors=min(k + 1, len(X)), metric="euclidean", n_jobs=-1)
-    nn.fit(X_scaled)
-    distances, _ = nn.kneighbors(X_scaled)
+        idx = rng.choice(len(mat), size=sample_size, replace=False)
+        mat = mat[idx]
+    nn = NearestNeighbors(n_neighbors=min(k + 1, len(mat)), metric="euclidean", n_jobs=-1)
+    nn.fit(mat)
+    distances, _ = nn.kneighbors(mat)
     knn_dists = distances[:, 1:].mean(axis=1)
     return float(np.median(knn_dists))
 
 
-def _ensure_features(df, state, feature_cols):
-    if state["scaler"] is None:
-        state["scaler"] = StandardScaler().fit(df[feature_cols].values)
-    if state["X_scaled"] is None:
-        state["X_scaled"] = state["scaler"].transform(df[feature_cols].values)
-    if state["X_ids"] is None:
-        state["X_ids"] = df["posting_id"].values
-
-
 def center_distances(state, center_id):
-    """Distanzvektor aller Cases zum Center (via cached X_scaled)."""
+    """Distance vector from all cases to a center in propagation space."""
     center_idx = np.where(state["X_ids"] == center_id)[0][0]
-    diff = state["X_scaled"] - state["X_scaled"][center_idx]
+    mat = _build_propagation_matrix(state)
+    diff = mat - mat[center_idx]
     return np.sqrt((diff ** 2).sum(axis=1))
 
 
-def _partition_from_cache(df, state):
-    """Voronoi-Partition über die Distanz-Caches der aktuellen Center."""
+def _partition_from_cache(state):
+    """Voronoi partition using cached center distances."""
     center_ids = list(state["centers"].keys())
     dist_matrix = np.column_stack([state["dist_cache"][c] for c in center_ids])
     nearest = dist_matrix.argmin(axis=1)
-    nearest_dist = dist_matrix[np.arange(len(df)), nearest]
+    nearest_dist = dist_matrix[np.arange(len(state["X_ids"])), nearest]
     covered = nearest_dist <= state["T"]
     state["nearest"] = nearest
     state["covered_arr"] = covered
@@ -105,20 +178,16 @@ def _uncertainty_scores(df, strategy, state):
 
 
 def greedy_iteration(df, strategy, state):
-    """Eine greedy Iteration: Selektion des most uncertain Case M, Oracle-Review,
-    ggf. neues Center (Split/neues Territorium), globaler Re-Partition, Propagation.
-
-    state: dict via new_state(T); Caches werden befüllt und bei skip- Iterationen
-    wiederverwendet (Re-Partition nur bei new_center/split).
+    """One greedy iteration: select most uncertain case M, oracle review,
+    new center / split / skip, global re-partition, label propagation.
 
     Returns: (df_updated, state_updated, meta)
     """
     meta = {}
-    feature_cols = get_feature_cols(df)
 
-    _ensure_features(df, state, feature_cols)
+    _ensure_propagation(df, state)
     if state["T"] is None:
-        state["T"] = estimate_threshold(df, feature_cols, scaler=state["scaler"])
+        state["T"] = estimate_threshold(state)
 
     df, score_col = _uncertainty_scores(df, strategy, state)
     pool_mask = ~df["posting_id"].isin(state["directly_corrected"])
@@ -148,12 +217,13 @@ def greedy_iteration(df, strategy, state):
             meta["type"] = "split"
             meta["split_from"] = cur_center
 
+    # Re-partition only when centers change; reuse on skip
     if meta["type"] in ("new_center", "split"):
         state["dist_cache"][M] = center_distances(state, M)
-        nearest, covered = _partition_from_cache(df, state)
+        nearest, covered = _partition_from_cache(state)
     else:
         if state["nearest"] is None:
-            nearest, covered = _partition_from_cache(df, state)
+            nearest, covered = _partition_from_cache(state)
         else:
             nearest, covered = state["nearest"], state["covered_arr"]
 
@@ -177,6 +247,7 @@ def greedy_iteration(df, strategy, state):
     meta["n_covered"] = len(state["covered"])
     meta["cumulative_direct"] = len(state["directly_corrected"])
     meta["n_flipped"] = int(changed.sum())
+    meta["prop_dims"] = _prop_dims(state)
     if len(covered_pos):
         acc = (df.loc[df.index[covered_pos], "label"].values == prop_labels[covered_pos]).mean()
         meta["propagation_accuracy"] = float(acc)

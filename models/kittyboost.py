@@ -71,8 +71,10 @@ def train_catboost(df, verbose = False, incremental = False, inc_model = None, f
 
     df_pred = (preds > best_t).astype(int)
 
-    if verbose or compute_shap:
-        shap_vals = model.get_feature_importance(train_pool, type="ShapValues")
+    # Always compute SHAP so propagation can use it. Only print when verbose.
+    shap_vals = model.get_feature_importance(train_pool, type="ShapValues")
+    # Drop the bias column (last column) — only keep per-feature contributions
+    shap_vals = shap_vals[:, :-1]
 
     if verbose:
         print("=== CATBOOST (Trainiert auf generated_label, evaluiert auf true label) ===")
@@ -95,4 +97,4 @@ def train_catboost(df, verbose = False, incremental = False, inc_model = None, f
     return_df = full_data if (incremental and full_data is not None) else df
     return_df['pred_score'] = preds
     return_df['pred_label'] = preds_class
-    return return_df, model.get_feature_importance(), precision, recall, model, tn, fp, fn, tp
+    return return_df, model.get_feature_importance(), precision, recall, model, tn, fp, fn, tp, shap_vals

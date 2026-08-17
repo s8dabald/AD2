@@ -25,7 +25,8 @@ def test_logger(header, results):
     print("Results saved to test_results.xlsx")
 
 def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, strategy="entropy",
-                     greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False):
+                     greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False,
+                     propagation_space=None, initial_shap=None):
     """Retrain CatBoost iteratively by correcting samples based on the specified strategy.
 
     Greedy-Modus (greedy_batching=True): pro Iteration genau 1 HITL-Review (most uncertain
@@ -43,9 +44,18 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
         compute_shap (bool): SHAP-Werte pro Trainingslauf berechnen.
         skip_retrain_on_skip (bool): Bei greedy 'skip'-Iterationen das (ergebnisgleiche)
             Retrain überspringen.
+        propagation_space (list): Which spaces to use for distance computation.
+            Options: "features_all", "features_raw", "features_flags",
+                     "shap_all", "shap_raw", "shap_flags".
+            Example: ["features_all"] (default), ["shap_all"], ["features_raw", "shap_all"].
+        initial_shap (np.array): SHAP values from initial model, shape (N, n_features).
+            Used to bootstrap the propagation state before first retrain.
     """
     if greedy_batching:
-        state = new_state(greedy_T)
+        state = new_state(greedy_T, propagation_space=propagation_space)
+        # Bootstrap SHAP from initial model so first iteration can use SHAP spaces
+        if initial_shap is not None:
+            state["shap_vals"] = initial_shap
     else:
         state = {"corrected": []}
 
@@ -83,14 +93,18 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
             print(f"Skip-Retrain (keine Labeländerung) | "
                   f"Precision: {precision:.4f}, Recall: {recall:.4f}")
         else:
-            df, cat_importances, precision, recall, cat_model, tn, fp, fn, tp = train_catboost(
+            df, cat_importances, precision, recall, cat_model, tn, fp, fn, tp, shap_vals = train_catboost(
                 df, corrected_ids=corrected_ids, corrected_weights=corrected_weights,
                 compute_shap=compute_shap
             )
+            # Store SHAP in state so greedy propagation can use it
+            if greedy_batching:
+                state["shap_vals"] = shap_vals
             print(f"Precision: {precision:.4f}, Recall: {recall:.4f}")
             if greedy_batching:
                 print(f"type={meta.get('type')}, centers={meta.get('n_centers')}, "
-                      f"covered={meta.get('n_covered')}, flipped={meta.get('n_flipped')}")
+                      f"covered={meta.get('n_covered')}, flipped={meta.get('n_flipped')}, "
+                      f"prop_dims={meta.get('prop_dims')}")
             else:
                 print(f"Misspredicted: {meta.get('misspredicted')}")
 
@@ -103,7 +117,7 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
                 extra = (f", type={meta.get('type')}, centers={meta.get('n_centers')}, "
                          f"covered={meta.get('n_covered')}, cum_direct={meta.get('cumulative_direct')}, "
                          f"flipped={meta.get('n_flipped')}, prop_acc={meta.get('propagation_accuracy'):.4f}, "
-                         f"T={state['T']:.4f}")
+                         f"T={state['T']:.4f}, prop_dims={meta.get('prop_dims')}")
             else:
                 extra = f", Misspredicted: {meta.get('misspredicted')}"
             results.append(base + extra)
@@ -141,7 +155,7 @@ def incremental_catboost(df, l=10, return_full_data=False):
         train_data = df if return_full_data else uncertain_df_updated
         
         # Train incrementally
-        df, cat_importances, precision, recall, cat_model, tn, fp, fn, tp = train_catboost(
+        df, cat_importances, precision, recall, cat_model, tn, fp, fn, tp, _shap_dummy = train_catboost(
             train_data, incremental=True, inc_model=cat_model, full_data=df
         )
         
@@ -160,24 +174,29 @@ def replace_posting(df, posting_id, replacement):
 def run_unsupervised():
     df, labels = full_dataprep()
     df_if = run_if(df, labels, verbose=False)
-    df_cat, cat_importances, precision, recall, cat_model,tn, fp, fn, tp = train_catboost(df_if, verbose=True)
+    df_cat, cat_importances, precision, recall, cat_model, tn, fp, fn, tp, initial_shap = train_catboost(df_if, verbose=True)
     print(f"\nInitial Precision: {precision:.4f}, Initial Recall: {recall:.4f}")
-    return df_cat, cat_importances, precision, recall, cat_model
+    return df_cat, cat_importances, precision, recall, cat_model, initial_shap
 
-def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False, greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False):
-    df, cat_importances, precision, recall, cat_model = run_unsupervised()
+def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False, greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False, propagation_space=None):
+    df, cat_importances, precision, recall, cat_model, initial_shap = run_unsupervised()
     if training_strat == 'incremental':
         df, cat_importances, precision, recall, cat_model, results = incremental_catboost(df, l, return_full_data)
     else:
         df, cat_importances, precision, recall, results = retrain_catboost(
             df, l, corrected_weights, corrected_saved, strategy,
             greedy_batching=greedy_batching, greedy_T=greedy_T,
-            compute_shap=compute_shap, skip_retrain_on_skip=skip_retrain_on_skip)
-    test_logger(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] | training_strat= {training_strat}, l={l}, corrected_weights = {corrected_weights}, corrected_saved = {corrected_saved}, strategy = {strategy}, greedy_batching = {greedy_batching}, greedy_T = {greedy_T}, compute_shap = {compute_shap}, skip_retrain_on_skip = {skip_retrain_on_skip}", results)
+            compute_shap=compute_shap, skip_retrain_on_skip=skip_retrain_on_skip,
+            propagation_space=propagation_space, initial_shap=initial_shap)
+    test_logger(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] | training_strat= {training_strat}, l={l}, corrected_weights = {corrected_weights}, corrected_saved = {corrected_saved}, strategy = {strategy}, greedy_batching = {greedy_batching}, greedy_T = {greedy_T}, compute_shap = {compute_shap}, skip_retrain_on_skip = {skip_retrain_on_skip}, propagation_space = {propagation_space}", results)
     return df, cat_importances, precision, recall, cat_model
 
 if __name__ == "__main__":
 
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=50, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False, greedy_batching=True, greedy_T=0.5)
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=50, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5)
+    # Baseline: features_all (same as before)
+    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=50, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5)
+    # SHAP propagation: shap_all
+    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=50, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_all"])
+    # Combined: raw features + all SHAP
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["features_all", "shap_all"])
     
