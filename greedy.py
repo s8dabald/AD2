@@ -63,6 +63,9 @@ def new_state(T=None, propagation_space=None):
         "shap_vals": None,
         "shap_raw_indices": None,
         "shap_flag_indices": None,
+        # selection / weighting
+        "nearest_dist": None,
+        "neighbor_density": None,
     }
 
 
@@ -124,6 +127,16 @@ def _prop_dims(state):
     return mat.shape[1]
 
 
+def _compute_neighbor_density(state):
+    """Anzahl Nachbarn innerhalb Radius T für jeden Fall in Propagierungs-Raum.
+    Wird nach jedem SHAP-Update neu berechnet (Matrix ändert sich)."""
+    from sklearn.neighbors import radius_neighbors_graph
+    mat = _build_propagation_matrix(state)
+    T = state["T"]
+    graph = radius_neighbors_graph(mat, radius=T, mode='connectivity', include_self=False)
+    state["neighbor_density"] = np.array(graph.sum(axis=1)).flatten().astype(float)
+
+
 def estimate_threshold(state, k=10, sample_size=5000, random_state=42):
     """Estimate cluster radius T as median of mean k-NN distances in propagation space.
     Deterministic via RandomState(seed)."""
@@ -156,6 +169,7 @@ def _partition_from_cache(state):
     covered = nearest_dist <= state["T"]
     state["nearest"] = nearest
     state["covered_arr"] = covered
+    state["nearest_dist"] = nearest_dist
     return nearest, covered
 
 
@@ -177,7 +191,7 @@ def _uncertainty_scores(df, strategy, state):
         raise ValueError(f"Unknown strategy: {strategy}")
 
 
-def greedy_iteration(df, strategy, state):
+def greedy_iteration(df, strategy, state, selection_mode="uncertainty"):
     """One greedy iteration: select most uncertain case M, oracle review,
     new center / split / skip, global re-partition, label propagation.
 
@@ -189,6 +203,9 @@ def greedy_iteration(df, strategy, state):
     if state["T"] is None:
         state["T"] = estimate_threshold(state)
 
+    # Neighbor density for selection (radius = T)
+    _compute_neighbor_density(state)
+
     df, score_col = _uncertainty_scores(df, strategy, state)
     pool_mask = ~df["posting_id"].isin(state["directly_corrected"])
     pool = df[pool_mask]
@@ -197,7 +214,16 @@ def greedy_iteration(df, strategy, state):
         meta["type"] = "no_candidates"
         return df, state, meta
 
-    m_pos = pool[score_col].idxmax()
+    if selection_mode == "uncertainty_density" and state["neighbor_density"] is not None:
+        pool_idx = pool.index.values
+        uncertainty = pool[score_col].values
+        density = state["neighbor_density"][pool_idx]
+        density_max = density.max()
+        density_norm = density / density_max if density_max > 0 else density
+        combined = uncertainty * density_norm
+        m_pos = pool.index[np.argmax(combined)]
+    else:
+        m_pos = pool[score_col].idxmax()
     M = df.loc[m_pos, "posting_id"]
     M_label = int(df.loc[m_pos, "label"])
     df = df.drop(columns=[score_col])
@@ -248,6 +274,9 @@ def greedy_iteration(df, strategy, state):
     meta["cumulative_direct"] = len(state["directly_corrected"])
     meta["n_flipped"] = int(changed.sum())
     meta["prop_dims"] = _prop_dims(state)
+    meta["selection_mode"] = selection_mode
+    M_idx = np.where(state["X_ids"] == M)[0][0]
+    meta["M_density"] = float(state["neighbor_density"][M_idx]) if state["neighbor_density"] is not None else 0.0
     if len(covered_pos):
         acc = (df.loc[df.index[covered_pos], "label"].values == prop_labels[covered_pos]).mean()
         meta["propagation_accuracy"] = float(acc)

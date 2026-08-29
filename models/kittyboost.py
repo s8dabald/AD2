@@ -4,11 +4,14 @@ import numpy as np
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, classification_report
 
 
-def train_catboost(df, verbose = False, incremental = False, inc_model = None, full_data = None, corrected_ids = None,corrected_weights=100, compute_shap=False):
+def train_catboost(df, verbose = False, incremental = False, inc_model = None, full_data = None, corrected_ids = None,corrected_weights=100, compute_shap=False, sample_weights=None):
     
     if corrected_ids is not None:
-        weights = np.ones(len(df))
-        weights[df['posting_id'].isin(corrected_ids)] = corrected_weights  # Erhöhe Gewicht für korrigierte Samples
+        if sample_weights is not None:
+            weights = sample_weights
+        else:
+            weights = np.ones(len(df))
+            weights[df['posting_id'].isin(corrected_ids)] = corrected_weights  # Erhöhe Gewicht für korrigierte Samples
     # Trainiere auf generated_label, evaluiere auf true label
     y_train_target = df["pred_label"].astype(int)  # Trainiere auf Rules
     y_true = df["label"].astype(int)  # Evaluiere auf echte Labels
