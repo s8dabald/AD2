@@ -29,37 +29,6 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
                      greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False,
                      propagation_space=None, initial_shap=None,
                      prop_weight_mode="uniform", selection_mode="uncertainty"):
-    """Retrain CatBoost iteratively by correcting samples based on the specified strategy.
-
-    Greedy-Modus (greedy_batching=True): pro Iteration genau 1 HITL-Review (most uncertain
-    Case M). Sein Label wird via globaler Voronoi-Partition auf alle Cases im Radius T
-    propagiert; Re-Selection mit Labeländerung splittet das Cluster (neues Center).
-
-    Args:
-        df (pd.DataFrame): Input DataFrame mit 'label', 'pred_label', 'posting_id'.
-        l (int): Anzahl Iterationen (= Anzahl HITL-Reviews im Greedy-Modus).
-        corrected_weights (int): Gewicht korrigierter Samples beim Retrain.
-        corrected_saved (bool): Geprüfte posting_ids in zukünftigen Queries ausschließen.
-        strategy (str): 'entropy', 'margin', 'novelty'.
-        greedy_batching (bool): Greedy Cluster Correction aktivieren.
-        greedy_T (float): Cluster-Radius (None -> wird geschätzt).
-        compute_shap (bool): SHAP-Werte pro Trainingslauf berechnen.
-        skip_retrain_on_skip (bool): Bei greedy 'skip'-Iterationen das (ergebnisgleiche)
-            Retrain überspringen.
-        propagation_space (list): Which spaces to use for distance computation.
-            Options: "features_all", "features_raw", "features_flags",
-                     "shap_all", "shap_raw", "shap_flags".
-            Example: ["features_all"] (default), ["shap_all"], ["features_raw", "shap_all"].
-        initial_shap (np.array): SHAP values from initial model, shape (N, n_features).
-            Used to bootstrap the propagation state before first retrain.
-        prop_weight_mode (str): Weight mode for propagated cases.
-            "uniform" (default): all covered get corrected_weights.
-            "linear_decay": weight = corrected_weights * max(0, 1 - dist/T).
-            "gaussian_decay": weight = corrected_weights * exp(-dist²/(2σ²)), σ=T/2.
-        selection_mode (str): Case selection strategy.
-            "uncertainty" (default): select globally most uncertain case.
-            "uncertainty_density": select uncertainty × neighbor density (radius=T).
-    """
     if greedy_batching:
         state = new_state(greedy_T, propagation_space=propagation_space)
         # Bootstrap SHAP from initial model so first iteration can use SHAP spaces
