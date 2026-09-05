@@ -171,22 +171,23 @@ def replace_posting(df, posting_id, replacement):
     df.loc[df['posting_id'] == posting_id, 'pred_label'] = replacement
     return df
 
-def run_unsupervised():
+def run_unsupervised(compute_shap=False):
     df, labels = full_dataprep()
     df_if = run_if(df, labels, verbose=False)
-    df_cat, cat_importances, precision, recall, cat_model, tn, fp, fn, tp, initial_shap = train_catboost(df_if, verbose=True)
+    df_cat, cat_importances, precision, recall, cat_model, tn, fp, fn, tp, initial_shap = train_catboost(df_if, verbose=True, compute_shap=compute_shap)
     print(f"\nInitial Precision: {precision:.4f}, Initial Recall: {recall:.4f}")
     return df_cat, cat_importances, precision, recall, cat_model, initial_shap
 
 def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False, greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False, propagation_space=None, prop_weight_mode="uniform", selection_mode="uncertainty"):
-    df, cat_importances, precision, recall, cat_model, initial_shap = run_unsupervised()
+    needs_shap = any(s.startswith("shap") for s in propagation_space) if propagation_space else False
+    df, cat_importances, precision, recall, cat_model, initial_shap = run_unsupervised(compute_shap=needs_shap)
     if training_strat == 'incremental':
         df, cat_importances, precision, recall, cat_model, results = incremental_catboost(df, l, return_full_data)
     else:
         df, cat_importances, precision, recall, results = retrain_catboost(
             df, l, corrected_weights, corrected_saved, strategy,
             greedy_batching=greedy_batching, greedy_T=greedy_T,
-            compute_shap=compute_shap, skip_retrain_on_skip=skip_retrain_on_skip,
+            compute_shap=needs_shap, skip_retrain_on_skip=skip_retrain_on_skip,
             propagation_space=propagation_space, initial_shap=initial_shap,
             prop_weight_mode=prop_weight_mode, selection_mode=selection_mode)
     test_logger(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] | training_strat= {training_strat}, l={l}, corrected_weights = {corrected_weights}, corrected_saved = {corrected_saved}, strategy = {strategy}, greedy_batching = {greedy_batching}, greedy_T = {greedy_T}, compute_shap = {compute_shap}, skip_retrain_on_skip = {skip_retrain_on_skip}, propagation_space = {propagation_space}, prop_weight_mode = {prop_weight_mode}, selection_mode = {selection_mode}", results)
@@ -201,7 +202,7 @@ if __name__ == "__main__":
     
     #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="uniform", selection_mode="uncertainty_density")
     
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="linear_decay")
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], selection_mode="uncertainty_density")
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="linear_decay", selection_mode="uncertainty_density")
+    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="linear_decay")
+    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], selection_mode="uncertainty_density")
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=2, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="linear_decay", selection_mode="uncertainty_density")
     

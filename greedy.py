@@ -63,6 +63,9 @@ def new_state(T=None, propagation_space=None):
         "shap_vals": None,
         "shap_raw_indices": None,
         "shap_flag_indices": None,
+        # matrix cache
+        "prop_matrix": None,
+        "prop_matrix_shap_id": None,
         # selection / weighting
         "nearest_dist": None,
         "neighbor_density": None,
@@ -98,6 +101,9 @@ def _ensure_propagation(df, state):
 def _build_propagation_matrix(state):
     """Build the combined matrix for distance computation based on propagation_space.
     Feature parts are already scaled, SHAP parts are used as-is (comparable scale)."""
+    if state["prop_matrix"] is not None and state["prop_matrix_shap_id"] == id(state["shap_vals"]):
+        return state["prop_matrix"]
+
     parts = []
     ps = state["propagation_space"]
 
@@ -118,13 +124,30 @@ def _build_propagation_matrix(state):
 
     if not parts:
         raise ValueError("propagation_space produced empty matrix — check your config")
-    return np.hstack(parts)
+    matrix = np.hstack(parts)
+    state["prop_matrix"] = matrix
+    state["prop_matrix_shap_id"] = id(state["shap_vals"])
+    return matrix
 
 
 def _prop_dims(state):
-    """Number of dimensions in the current propagation matrix (for logging)."""
-    mat = _build_propagation_matrix(state)
-    return mat.shape[1]
+    """Number of dimensions in the current propagation space (no matrix allocation)."""
+    ps = state["propagation_space"]
+    dims = 0
+    if "features_all" in ps and state["prop_scaled"] is not None:
+        dims += state["prop_scaled"].shape[1]
+    if "features_raw" in ps and state["prop_raw_scaled"] is not None:
+        dims += state["prop_raw_scaled"].shape[1]
+    if "features_flags" in ps and state["prop_flags_scaled"] is not None:
+        dims += state["prop_flags_scaled"].shape[1]
+    if state["shap_vals"] is not None:
+        if "shap_all" in ps:
+            dims += state["shap_vals"].shape[1]
+        if "shap_raw" in ps and state["shap_raw_indices"] is not None:
+            dims += len(state["shap_raw_indices"])
+        if "shap_flags" in ps and state["shap_flag_indices"] is not None:
+            dims += len(state["shap_flag_indices"])
+    return dims
 
 
 def _compute_neighbor_density(state):
@@ -203,9 +226,6 @@ def greedy_iteration(df, strategy, state, selection_mode="uncertainty"):
     if state["T"] is None:
         state["T"] = estimate_threshold(state)
 
-    # Neighbor density for selection (radius = T)
-    _compute_neighbor_density(state)
-
     df, score_col = _uncertainty_scores(df, strategy, state)
     pool_mask = ~df["posting_id"].isin(state["directly_corrected"])
     pool = df[pool_mask]
@@ -214,7 +234,8 @@ def greedy_iteration(df, strategy, state, selection_mode="uncertainty"):
         meta["type"] = "no_candidates"
         return df, state, meta
 
-    if selection_mode == "uncertainty_density" and state["neighbor_density"] is not None:
+    if selection_mode == "uncertainty_density":
+        _compute_neighbor_density(state)
         pool_idx = pool.index.values
         uncertainty = pool[score_col].values
         density = state["neighbor_density"][pool_idx]

@@ -74,10 +74,11 @@ def train_catboost(df, verbose = False, incremental = False, inc_model = None, f
 
     df_pred = (preds > best_t).astype(int)
 
-    # Always compute SHAP so propagation can use it. Only print when verbose.
-    shap_vals = model.get_feature_importance(train_pool, type="ShapValues")
-    # Drop the bias column (last column) — only keep per-feature contributions
-    shap_vals = shap_vals[:, :-1]
+    if compute_shap:
+        shap_vals = model.get_feature_importance(train_pool, type="ShapValues")
+        shap_vals = shap_vals[:, :-1]
+    else:
+        shap_vals = None
 
     if verbose:
         print("=== CATBOOST (Trainiert auf generated_label, evaluiert auf true label) ===")
@@ -87,8 +88,9 @@ def train_catboost(df, verbose = False, incremental = False, inc_model = None, f
         print("F1 @ best threshold:", max(f1_scores))
         print("\n=== METRICS (optimierter Threshold) ===")
         print(classification_report(y_true, df_pred, zero_division=0))
-        print("\nSHAP:")
-        print(shap_vals[:5])
+        if shap_vals is not None:
+            print("\nSHAP:")
+            print(shap_vals[:5])
     
     tn, fp, fn, tp = confusion_matrix(y_true, df_pred).ravel()
     print("\n=== Confusion Matrix (optimierter Threshold) ===")

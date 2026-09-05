@@ -51,9 +51,7 @@ def run_if(df, labels, verbose=False):
         print("Feature vector length:", X_final.shape[1])
         print("Threshold used:", threshold)
 
-    df_if = df.copy()
-    df_if['pred_score'] = anomaly_scores
-    df_if['pred_label'] = pred_labels
+    df_if = df.assign(pred_score=anomaly_scores, pred_label=pred_labels)
     df_if = df_if.merge(labels.reset_index(), on='posting_id')
 
     return df_if
