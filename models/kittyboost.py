@@ -41,7 +41,7 @@ def train_catboost(df, verbose = False, incremental = False, inc_model = None, f
         depth=8,
         learning_rate=0.05,
         loss_function="Logloss",
-        eval_metric="AUC",
+        task_type='GPU',
         random_seed=42,
         verbose=False,
         class_weights={0: weight_normal, 1: weight_anomaly} #das wurde geändert wegen error
