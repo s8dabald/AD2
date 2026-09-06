@@ -25,6 +25,28 @@ def test_logger(header, results):
     wb.save("test_results.xlsx")
     print("Results saved to test_results.xlsx")
 
+def _compute_sample_weights(df, state, prop_weight_mode, corrected_weights):
+    """Per-case weights for distance-decayed propagation labels."""
+    if prop_weight_mode == "uniform" or state["nearest_dist"] is None:
+        return None
+    covered_mask = state["covered_arr"]
+    nearest_dist = state["nearest_dist"]
+    t = state["T"]
+    if prop_weight_mode == "linear_decay":
+        factors = np.maximum(0.0, 1.0 - nearest_dist / t)
+    elif prop_weight_mode == "gaussian_decay":
+        sigma = t / 2.0
+        factors = np.exp(-(nearest_dist ** 2) / (2 * sigma ** 2))
+    else:
+        factors = np.ones(len(df))
+    sample_weights = np.ones(len(df))
+    sample_weights[covered_mask] = corrected_weights * factors[covered_mask]
+    # Direct oracle corrections always get full weight
+    for pid in state["directly_corrected"]:
+        idx = np.where(state["X_ids"] == pid)[0][0]
+        sample_weights[idx] = corrected_weights
+    return sample_weights
+
 def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, strategy="entropy",
                      greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False,
                      propagation_space=None, initial_shap=None,
@@ -71,25 +93,7 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
             print(f"Skip-Retrain (keine Labeländerung) | "
                   f"Precision: {precision:.4f}, Recall: {recall:.4f}")
         else:
-            # Compute per-case sample weights (distance-decayed propagation)
-            sample_weights = None
-            if greedy_batching and prop_weight_mode != "uniform" and state["nearest_dist"] is not None:
-                covered_mask = state["covered_arr"]
-                nearest_dist = state["nearest_dist"]
-                t = state["T"]
-                if prop_weight_mode == "linear_decay":
-                    factors = np.maximum(0.0, 1.0 - nearest_dist / t)
-                elif prop_weight_mode == "gaussian_decay":
-                    sigma = t / 2.0
-                    factors = np.exp(-(nearest_dist ** 2) / (2 * sigma ** 2))
-                else:
-                    factors = np.ones(len(df))
-                sample_weights = np.ones(len(df))
-                sample_weights[covered_mask] = corrected_weights * factors[covered_mask]
-                # Direct oracle corrections always get full weight
-                for pid in state["directly_corrected"]:
-                    idx = np.where(state["X_ids"] == pid)[0][0]
-                    sample_weights[idx] = corrected_weights
+            sample_weights = _compute_sample_weights(df, state, prop_weight_mode, corrected_weights) if greedy_batching else None
 
             df, cat_importances, precision, recall, cat_model, tn, fp, fn, tp, shap_vals = train_catboost(
                 df, corrected_ids=corrected_ids, corrected_weights=corrected_weights,
@@ -124,47 +128,89 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
 
     return df, cat_importances, precision, recall, results
 
-def incremental_catboost(df, l=10, return_full_data=False):
-    corrected = []
-    cat_model = None
+def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, strategy="entropy",
+                         greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False,
+                         propagation_space=None, initial_shap=None,
+                         prop_weight_mode="uniform", selection_mode="uncertainty"):
+    """Like retrain_catboost, but continues the previous model via init_model
+    instead of a full 500-tree retrain (warm start)."""
+    if greedy_batching:
+        state = new_state(greedy_T, propagation_space=propagation_space)
+        # Bootstrap SHAP from initial model so first iteration can use SHAP spaces
+        if initial_shap is not None:
+            state["shap_vals"] = initial_shap
+    else:
+        state = {"corrected": []}
+
+    novelty_cache = novelty_scores(df) if strategy == "novelty" else None
+
     results = []
-    counter = 0
-    
+    target_iters = {1, l//2 + 1, l}
+    cat_importances = None
+    cat_model = None
+    precision = recall = 0.0
+    tn = fp = fn = tp = 0
+
     for i in range(l):
         print(f"\n=== Incremental Iteration {i+1} ===")
-        
-        # Get uncertain samples
-        uncertain_df = uncertainty_query(df, strategy="entropy", exclude_posting_ids=corrected)
-        
-        if uncertain_df.empty:
-            print("No more uncertain samples.")
-            break
-        
-        counter += 1
-        
-        # Vectorized: Replace labels for all uncertain samples at once
-        mask = df['posting_id'].isin(uncertain_df['posting_id'])
-        misspredicted = (df.loc[mask, 'label'] != df.loc[mask, 'pred_label']).sum()
-        df.loc[mask, 'pred_label'] = df.loc[mask, 'label']
-        corrected.extend(uncertain_df['posting_id'].tolist())
-        
-        # Get the updated uncertain_df from df
-        uncertain_df_updated = df[df['posting_id'].isin(uncertain_df['posting_id'])].copy()
-        
-        # Choose training dataset based on return_full_data flag
-        train_data = df if return_full_data else uncertain_df_updated
-        
-        # Train incrementally
-        df, cat_importances, precision, recall, cat_model, tn, fp, fn, tp, _shap_dummy = train_catboost(
-            train_data, incremental=True, inc_model=cat_model, full_data=df
-        )
-        
-        print(f"Precision: {precision:.4f}, Recall: {recall:.4f}")
-        print(f"Misspredicted: {misspredicted}")
-        
-        if counter in {1, l//2 + 1, l}:
-            results.append(f"Iteration: {counter}, Precision: {precision:.4f}, Recall: {recall:.4f}, TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
-    
+
+        if greedy_batching:
+            df, state, meta = greedy_iteration(df, strategy, state, selection_mode=selection_mode)
+            if meta.get("type") == "no_candidates":
+                print("No more candidates in pool.")
+                break
+            corrected_ids = list(state["directly_corrected"] | state["covered"])
+            skip_retrain = skip_retrain_on_skip and meta.get("type") == "skip"
+        else:
+            uncertain_df = uncertainty_query(df, strategy, exclude_posting_ids=state["corrected"],
+                                             novelty_scores=novelty_cache)
+            meta = {}
+            mask = df['posting_id'].isin(uncertain_df['posting_id'])
+            meta["misspredicted"] = (df.loc[mask, 'label'] != df.loc[mask, 'pred_label']).sum()
+            df.loc[mask, 'pred_label'] = df.loc[mask, 'label']
+            if corrected_saved:
+                state["corrected"].extend(uncertain_df['posting_id'].tolist())
+            corrected_ids = state["corrected"]
+            skip_retrain = False
+
+        if skip_retrain:
+            print(f"Skip-Retrain (keine Labeländerung) | "
+                  f"Precision: {precision:.4f}, Recall: {recall:.4f}")
+        else:
+            sample_weights = _compute_sample_weights(df, state, prop_weight_mode, corrected_weights) if greedy_batching else None
+
+            df, cat_importances, precision, recall, cat_model, tn, fp, fn, tp, shap_vals = train_catboost(
+                df, incremental=True, inc_model=cat_model, full_data=df,
+                corrected_ids=corrected_ids, corrected_weights=corrected_weights,
+                sample_weights=sample_weights, compute_shap=compute_shap
+            )
+            # Store SHAP in state so greedy propagation can use it
+            if greedy_batching:
+                state["shap_vals"] = shap_vals
+            print(f"Precision: {precision:.4f}, Recall: {recall:.4f}")
+            if greedy_batching:
+                print(f"type={meta.get('type')}, centers={meta.get('n_centers')}, "
+                      f"covered={meta.get('n_covered')}, flipped={meta.get('n_flipped')}, "
+                      f"prop_dims={meta.get('prop_dims')}, "
+                      f"M_density={meta.get('M_density', 0):.0f}")
+            else:
+                print(f"Misspredicted: {meta.get('misspredicted')}")
+
+        if (i+1) in target_iters:
+            base = (f"Iteration: {i+1}, Precision: {precision:.4f}, Recall: {recall:.4f}, "
+                    f"TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
+            if skip_retrain:
+                extra = ", type=skip (retrain skipped)"
+            elif greedy_batching:
+                extra = (f", type={meta.get('type')}, centers={meta.get('n_centers')}, "
+                         f"covered={meta.get('n_covered')}, cum_direct={meta.get('cumulative_direct')}, "
+                         f"flipped={meta.get('n_flipped')}, prop_acc={meta.get('propagation_accuracy'):.4f}, "
+                         f"T={state['T']:.4f}, prop_dims={meta.get('prop_dims')}, "
+                         f"weight_mode={prop_weight_mode}, sel_mode={selection_mode}")
+            else:
+                extra = f", Misspredicted: {meta.get('misspredicted')}"
+            results.append(base + extra)
+
     return df, cat_importances, precision, recall, cat_model, results
 
 def replace_posting(df, posting_id, replacement):
@@ -182,7 +228,12 @@ def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corre
     needs_shap = any(s.startswith("shap") for s in propagation_space) if propagation_space else False
     df, cat_importances, precision, recall, cat_model, initial_shap = run_unsupervised(compute_shap=needs_shap)
     if training_strat == 'incremental':
-        df, cat_importances, precision, recall, cat_model, results = incremental_catboost(df, l, return_full_data)
+        df, cat_importances, precision, recall, cat_model, results = incremental_catboost(
+            df, l, corrected_weights, corrected_saved, strategy,
+            greedy_batching=greedy_batching, greedy_T=greedy_T,
+            compute_shap=needs_shap, skip_retrain_on_skip=skip_retrain_on_skip,
+            propagation_space=propagation_space, initial_shap=initial_shap,
+            prop_weight_mode=prop_weight_mode, selection_mode=selection_mode)
     else:
         df, cat_importances, precision, recall, results = retrain_catboost(
             df, l, corrected_weights, corrected_saved, strategy,
@@ -204,5 +255,6 @@ if __name__ == "__main__":
     
     #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="linear_decay")
     #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], selection_mode="uncertainty_density")
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="linear_decay", selection_mode="uncertainty_density")
+    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="linear_decay", selection_mode="uncertainty_density")
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='incremental', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="linear_decay", selection_mode="uncertainty_density")
     
