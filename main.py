@@ -1,5 +1,4 @@
 import os
-import shutil
 from datetime import datetime
 
 from dataprep import full_dataprep
@@ -11,34 +10,39 @@ from querystep import uncertainty_query, novelty_scores
 from greedy import greedy_iteration, new_state
 from openpyxl import Workbook, load_workbook
 
+def _drive_results_path():
+    """Drive-Pfad der Ergebnisdatei auf Colab, sonst None."""
+    if os.path.isdir("/content/drive/MyDrive"):
+        return "/content/drive/MyDrive/test_results.xlsx"
+    return None
+
 def test_logger(header, results):
+    drive_path = _drive_results_path()
+    # Basis-Workbook: Drive (akkumuliert ueber mehrere Colab-Runs) > lokal > neu
+    base = drive_path if (drive_path and os.path.exists(drive_path)) else None
+    if base is None and os.path.exists("test_results.xlsx"):
+        base = "test_results.xlsx"
     try:
-        wb = load_workbook("test_results.xlsx")
+        wb = load_workbook(base) if base else Workbook()
         ws = wb.active
-    except:
+    except Exception:
         wb = Workbook()
         ws = wb.active
-    
+
     ws.append([header])
     for result_str in results:
         ws.append([result_str])
     ws.append(["'" + "=" * 80])  # separator line
-    
-    wb.save("test_results.xlsx")
-    print("Results saved to test_results.xlsx")
-    _backup_to_drive("test_results.xlsx")
 
-def _backup_to_drive(local_file):
-    """Kopiert die Ergebnis-Datei nach Google Drive (Colab), falls gemountet."""
-    drive_root = "/content/drive/MyDrive"
-    if not os.path.isdir(drive_root):
-        return
-    try:
-        dest = os.path.join(drive_root, os.path.basename(local_file))
-        shutil.copy2(local_file, dest)
-        print("Results saved to Drive:", dest)
-    except Exception as e:
-        print("Drive backup failed:", e)
+    for path in ["test_results.xlsx"] + ([drive_path] if drive_path else []):
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            wb.save(path)
+            print("Results saved to", path)
+        except Exception as e:
+            print("Failed to save", path, ":", e)
 
 def _compute_sample_weights(df, state, prop_weight_mode, corrected_weights):
     """Per-case weights for distance-decayed propagation labels."""
