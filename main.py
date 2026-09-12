@@ -456,7 +456,7 @@ if __name__ == "__main__":
     #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="linear_decay")
     #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], selection_mode="uncertainty_density")
     #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="linear_decay", selection_mode="uncertainty_density")
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='incremental', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
+    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='incremental', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
     
     # ========================================================================
     # TO TEST: Early-Stop (Chunked Training) - noch nicht getestete Varianten
@@ -468,20 +468,20 @@ if __name__ == "__main__":
     # - MODERATE: min_delta=0.001  -> laeuft haeufig bis ans Cap von 500 Baeumen
 
     # --- greedy + shap_raw, Baseline OFF (Referenz/Wandzeit) ---
-    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
 
     # --- greedy + shap_raw, early_stop STRICT ---
-    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], early_stop=True, chunk_size=50, min_delta=0.01, stop_patience=2)
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], early_stop=True, chunk_size=50, min_delta=0.01, stop_patience=2)
 
     # --- greedy + shap_raw, early_stop MODERATE ---
-    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], early_stop=True, chunk_size=50, min_delta=0.001, stop_patience=2)
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], early_stop=True, chunk_size=50, min_delta=0.001, stop_patience=2)
 
     # --- non-greedy (uncertainty) Baseline OFF, reiner Laufzeit-Vergleich ---
-    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin")
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin")
 
     # --- non-greedy, early_stop STRICT ---
-    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", early_stop=True, chunk_size=50, min_delta=0.01, stop_patience=2)
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", early_stop=True, chunk_size=50, min_delta=0.01, stop_patience=2)
 
     # --- non-greedy, early_stop MODERATE ---
-    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", early_stop=True, chunk_size=50, min_delta=0.001, stop_patience=2)
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", early_stop=True, chunk_size=50, min_delta=0.001, stop_patience=2)
     
