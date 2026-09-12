@@ -4,7 +4,7 @@ import numpy as np
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, classification_report
 
 
-def train_catboost(df, verbose = False, incremental = False, inc_model = None, full_data = None, corrected_ids = None,corrected_weights=100, compute_shap=False, sample_weights=None, incremental_iters=20):
+def train_catboost(df, verbose = False, incremental = False, inc_model = None, full_data = None, corrected_ids = None,corrected_weights=100, compute_shap=False, sample_weights=None, incremental_iters=20, early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2, seed=42):
     # Trainiere auf generated_label, evaluiere auf true label
     y_train_target = df["pred_label"].astype(int)  # Trainiere auf Rules
     y_true = df["label"].astype(int)  # Evaluiere auf echte Labels
@@ -29,7 +29,7 @@ def train_catboost(df, verbose = False, incremental = False, inc_model = None, f
         learning_rate=0.05,
         loss_function="Logloss",
         #task_type='GPU',  # flip manually for Colab
-        random_seed=42,
+        random_seed=seed,
         verbose=False,
     )
 
@@ -57,8 +57,47 @@ def train_catboost(df, verbose = False, incremental = False, inc_model = None, f
         else:
             train_pool = Pool(X, y_train_target)
 
-    model = CatBoostClassifier(**model_kwargs)
-    model.fit(train_pool, init_model=inc_model if incremental else None)
+    reason = "cap"
+    chunk_curve = []
+    if early_stop:
+        # Chunked Training mit Label-freiem Plateau-Stop:
+        # Stop, wenn sich die Vorhersagen zwischen Chunks kaum noch aendern
+        # (mean|delta pred| < min_delta fuer stop_patience Chunks hintereinander).
+        rng = np.random.RandomState(seed)
+        sample_idx = rng.choice(len(df), size=min(20000, len(df)), replace=False)
+        X_all = df.drop(columns=["label", "posting_id", "pred_label", "pred_score"]).reset_index(drop=True)
+        X_sample = X_all.iloc[sample_idx]
+        model = None
+        prev_pred = None
+        stalls = 0
+        total = 0
+        while total < its:
+            n = min(chunk_size, its - total)
+            chunk_kwargs = dict(model_kwargs)
+            chunk_kwargs["iterations"] = n
+            chunk_model = CatBoostClassifier(**chunk_kwargs)
+            chunk_model.fit(train_pool, init_model=model if model is not None else (inc_model if incremental else None))
+            total += n
+            pred = chunk_model.predict_proba(X_sample)[:, 1]
+            if prev_pred is None:
+                delta = float("inf")
+            else:
+                delta = float(np.mean(np.abs(pred - prev_pred)))
+            prev_pred = pred
+            if delta < min_delta:
+                stalls += 1
+            else:
+                stalls = 0
+            print(f"[chunk] trees={total}, delta={delta:.6f}, stalls={stalls}")
+            chunk_curve.append({"trees": total, "delta": delta, "stalls": stalls})
+            model = chunk_model
+            if stalls >= stop_patience:
+                reason = "plateau"
+                print(f"EarlyStop bei {total} Baeumen (mean|delta| < {min_delta})")
+                break
+    else:
+        model = CatBoostClassifier(**model_kwargs)
+        model.fit(train_pool, init_model=inc_model if incremental else None)
 
     # eval metrics always on the same data the final predictions are computed on
     if incremental and full_data is not None:
@@ -113,4 +152,10 @@ def train_catboost(df, verbose = False, incremental = False, inc_model = None, f
     return_df = full_data if (incremental and full_data is not None) else df
     return_df['pred_score'] = preds
     return_df['pred_label'] = preds_class
-    return return_df, model.get_feature_importance(), precision, recall, model, tn, fp, fn, tp, shap_vals
+    early_stop_info = {
+        "active": early_stop,
+        "tree_count": model.tree_count_,
+        "stop_reason": reason if early_stop else None,
+        "chunk_curve": chunk_curve,
+    }
+    return return_df, model.get_feature_importance(), precision, recall, model, tn, fp, fn, tp, shap_vals, early_stop_info
