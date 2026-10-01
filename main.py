@@ -11,7 +11,7 @@ import pandas as pd
 from isolation_forest import run_if
 from models.kittyboost import train_catboost
 from querystep import uncertainty_query, novelty_scores
-from greedy import greedy_iteration, new_state
+from greedy import greedy_iteration, new_state, reviewer_rule_propagate
 from openpyxl import Workbook, load_workbook
 
 _UNC_BUCKETS = [10, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
@@ -115,7 +115,8 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
                      propagation_space=None, initial_shap=None,
                      prop_weight_mode="uniform", selection_mode="uncertainty",
                      early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2,
-                     seed=42, run=None):
+                     seed=42, run=None, retrain_every=1,
+                     propagation_mode="auto_greedy", prop_k=2, prop_delta=0.25):
     if greedy_batching:
         state = new_state(greedy_T, propagation_space=propagation_space)
         # Bootstrap SHAP from initial model so first iteration can use SHAP spaces
@@ -142,7 +143,11 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
         unc_rec = _uncertainty_distribution(df, strategy, novelty_cache)
 
         if greedy_batching:
-            df, state, meta = greedy_iteration(df, strategy, state, selection_mode=selection_mode)
+            if propagation_mode == "shap_box":
+                df, state, meta = reviewer_rule_propagate(df, strategy, state, selection_mode=selection_mode,
+                                                          prop_k=prop_k, prop_delta=prop_delta)
+            else:
+                df, state, meta = greedy_iteration(df, strategy, state, selection_mode=selection_mode)
             if meta.get("type") == "no_candidates":
                 print("No more candidates in pool.")
                 break
@@ -161,10 +166,17 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
             skip_retrain = False
         query_s = time.time() - t_q
 
-        if skip_retrain:
-            print(f"Skip-Retrain (keine Labeländerung) | "
-                  f"Precision: {precision:.4f}, Recall: {recall:.4f}, Trees: {trees_this}"
-                  f", dur {time.time()-t_iter:.1f}s (query {query_s:.1f}s, train 0.0s)")
+        should_retrain = ((i + 1) % retrain_every == 0) and not skip_retrain
+        if not should_retrain:
+            if skip_retrain:
+                print(f"Skip-Retrain (keine Labeländerung) | "
+                      f"Precision: {precision:.4f}, Recall: {recall:.4f}, Trees: {trees_this}"
+                      f", dur {time.time()-t_iter:.1f}s (query {query_s:.1f}s, train 0.0s)")
+            else:
+                next_retrain = ((i + 1) // retrain_every + 1) * retrain_every
+                print(f"LAZY (kein Retrain, nächster @ Iter {next_retrain}) | "
+                      f"Precision: {precision:.4f}, Recall: {recall:.4f}, Trees: {trees_this}"
+                      f", dur {time.time()-t_iter:.1f}s (query {query_s:.1f}s, train 0.0s)")
             train_s = 0.0
             es = None
         else:
@@ -185,10 +197,17 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
             print(f"Precision: {precision:.4f}, Recall: {recall:.4f}, Trees (this iter): {trees_this}"
                   f", dur {time.time()-t_iter:.1f}s (query {query_s:.1f}s, train {train_s:.1f}s)")
             if greedy_batching:
-                print(f"type={meta.get('type')}, centers={meta.get('n_centers')}, "
-                      f"covered={meta.get('n_covered')}, flipped={meta.get('n_flipped')}, "
-                      f"prop_dims={meta.get('prop_dims')}, "
-                      f"M_density={meta.get('M_density', 0):.0f}")
+                if propagation_mode == "shap_box":
+                    r = meta.get("rule") or {}
+                    band_str = ", ".join(f"{f} ∈ [{lo:.4f},{hi:.4f}]" for f, (lo, hi)
+                                         in zip(r.get("features", []), r.get("bands", [])))
+                    print(f"REVIEWER-RULE ({meta.get('type')}): {band_str} → {meta.get('n_covered')} Cases "
+                          f"(acc={meta.get('propagation_accuracy'):.4f}, flipped={meta.get('n_flipped')})")
+                else:
+                    print(f"type={meta.get('type')}, centers={meta.get('n_centers')}, "
+                          f"covered={meta.get('n_covered')}, flipped={meta.get('n_flipped')}, "
+                          f"prop_dims={meta.get('prop_dims')}, "
+                          f"M_density={meta.get('M_density', 0):.0f}")
             else:
                 print(f"Misspredicted: {meta.get('misspredicted')}")
 
@@ -204,6 +223,7 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
                     "n_flipped": meta.get("n_flipped"), "propagation_accuracy": meta.get("propagation_accuracy"),
                     "prop_dims": meta.get("prop_dims"), "M_density": meta.get("M_density"),
                     "T": state.get("T"), "selection_mode": selection_mode,
+                    "rule": meta.get("rule"), "propagation_mode": propagation_mode,
                 }
                 corrected_so_far = meta.get("cumulative_direct")
             else:
@@ -211,7 +231,7 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
                 corrected_so_far = len(state["corrected"])
             run.write("iter", run_id=run.run_id,
                       iteration=i + 1,
-                      mode="skip" if skip_retrain else "retrain",
+                      mode="skip" if skip_retrain else ("lazy" if not should_retrain else "retrain"),
                       precision=precision, recall=recall,
                       trees_this=trees_this,
                       model_trees=cat_model.tree_count_ if cat_model is not None else None,
@@ -230,6 +250,12 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
                     f"TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
             if skip_retrain:
                 extra = ", type=skip (retrain skipped)"
+            elif greedy_batching and propagation_mode == "shap_box":
+                r = meta.get("rule") or {}
+                band_str = ", ".join(f"{f}∈[{lo:.4f},{hi:.4f}]" for f, (lo, hi)
+                                     in zip(r.get("features", []), r.get("bands", [])))
+                extra = (f", type={meta.get('type')}, rule=[{band_str}], covered={meta.get('n_covered')}, "
+                         f"flipped={meta.get('n_flipped')}, prop_acc={meta.get('propagation_accuracy'):.4f}")
             elif greedy_batching:
                 extra = (f", type={meta.get('type')}, centers={meta.get('n_centers')}, "
                          f"covered={meta.get('n_covered')}, cum_direct={meta.get('cumulative_direct')}, "
@@ -247,7 +273,8 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
                          propagation_space=None, initial_shap=None,
                          prop_weight_mode="uniform", selection_mode="uncertainty",
                          early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2,
-                         seed=42, run=None):
+                         seed=42, run=None, retrain_every=1,
+                         propagation_mode="auto_greedy", prop_k=2, prop_delta=0.25):
     """Like retrain_catboost, but continues the previous model via init_model
     instead of a full 500-tree retrain (warm start)."""
     if greedy_batching:
@@ -277,7 +304,11 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
         unc_rec = _uncertainty_distribution(df, strategy, novelty_cache)
 
         if greedy_batching:
-            df, state, meta = greedy_iteration(df, strategy, state, selection_mode=selection_mode)
+            if propagation_mode == "shap_box":
+                df, state, meta = reviewer_rule_propagate(df, strategy, state, selection_mode=selection_mode,
+                                                          prop_k=prop_k, prop_delta=prop_delta)
+            else:
+                df, state, meta = greedy_iteration(df, strategy, state, selection_mode=selection_mode)
             if meta.get("type") == "no_candidates":
                 print("No more candidates in pool.")
                 break
@@ -296,10 +327,17 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
             skip_retrain = False
         query_s = time.time() - t_q
 
-        if skip_retrain:
-            print(f"Skip-Retrain (keine Labeländerung) | "
-                  f"Precision: {precision:.4f}, Recall: {recall:.4f}, Trees: {trees_this}"
-                  f", dur {time.time()-t_iter:.1f}s (query {query_s:.1f}s, train 0.0s)")
+        should_retrain = ((i + 1) % retrain_every == 0) and not skip_retrain
+        if not should_retrain:
+            if skip_retrain:
+                print(f"Skip-Retrain (keine Labeländerung) | "
+                      f"Precision: {precision:.4f}, Recall: {recall:.4f}, Trees: {trees_this}"
+                      f", dur {time.time()-t_iter:.1f}s (query {query_s:.1f}s, train 0.0s)")
+            else:
+                next_retrain = ((i + 1) // retrain_every + 1) * retrain_every
+                print(f"LAZY (kein Retrain, nächster @ Iter {next_retrain}) | "
+                      f"Precision: {precision:.4f}, Recall: {recall:.4f}, Trees: {trees_this}"
+                      f", dur {time.time()-t_iter:.1f}s (query {query_s:.1f}s, train 0.0s)")
             train_s = 0.0
             es = None
         else:
@@ -323,10 +361,17 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
             print(f"Precision: {precision:.4f}, Recall: {recall:.4f}, Trees (this iter): {trees_this}"
                   f", dur {time.time()-t_iter:.1f}s (query {query_s:.1f}s, train {train_s:.1f}s)")
             if greedy_batching:
-                print(f"type={meta.get('type')}, centers={meta.get('n_centers')}, "
-                      f"covered={meta.get('n_covered')}, flipped={meta.get('n_flipped')}, "
-                      f"prop_dims={meta.get('prop_dims')}, "
-                      f"M_density={meta.get('M_density', 0):.0f}")
+                if propagation_mode == "shap_box":
+                    r = meta.get("rule") or {}
+                    band_str = ", ".join(f"{f} ∈ [{lo:.4f},{hi:.4f}]" for f, (lo, hi)
+                                         in zip(r.get("features", []), r.get("bands", [])))
+                    print(f"REVIEWER-RULE ({meta.get('type')}): {band_str} → {meta.get('n_covered')} Cases "
+                          f"(acc={meta.get('propagation_accuracy'):.4f}, flipped={meta.get('n_flipped')})")
+                else:
+                    print(f"type={meta.get('type')}, centers={meta.get('n_centers')}, "
+                          f"covered={meta.get('n_covered')}, flipped={meta.get('n_flipped')}, "
+                          f"prop_dims={meta.get('prop_dims')}, "
+                          f"M_density={meta.get('M_density', 0):.0f}")
             else:
                 print(f"Misspredicted: {meta.get('misspredicted')}")
 
@@ -342,6 +387,7 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
                     "n_flipped": meta.get("n_flipped"), "propagation_accuracy": meta.get("propagation_accuracy"),
                     "prop_dims": meta.get("prop_dims"), "M_density": meta.get("M_density"),
                     "T": state.get("T"), "selection_mode": selection_mode,
+                    "rule": meta.get("rule"), "propagation_mode": propagation_mode,
                 }
                 corrected_so_far = meta.get("cumulative_direct")
             else:
@@ -349,7 +395,7 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
                 corrected_so_far = len(state["corrected"])
             run.write("iter", run_id=run.run_id,
                       iteration=i + 1,
-                      mode="skip" if skip_retrain else "incremental",
+                      mode="skip" if skip_retrain else ("lazy" if not should_retrain else "incremental"),
                       precision=precision, recall=recall,
                       trees_this=trees_this,
                       model_trees=cat_model.tree_count_ if cat_model is not None else None,
@@ -368,6 +414,12 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
                     f"TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
             if skip_retrain:
                 extra = ", type=skip (retrain skipped)"
+            elif greedy_batching and propagation_mode == "shap_box":
+                r = meta.get("rule") or {}
+                band_str = ", ".join(f"{f}∈[{lo:.4f},{hi:.4f}]" for f, (lo, hi)
+                                     in zip(r.get("features", []), r.get("bands", [])))
+                extra = (f", type={meta.get('type')}, rule=[{band_str}], covered={meta.get('n_covered')}, "
+                         f"flipped={meta.get('n_flipped')}, prop_acc={meta.get('propagation_accuracy'):.4f}")
             elif greedy_batching:
                 extra = (f", type={meta.get('type')}, centers={meta.get('n_centers')}, "
                          f"covered={meta.get('n_covered')}, cum_direct={meta.get('cumulative_direct')}, "
@@ -402,8 +454,12 @@ def run_unsupervised(compute_shap=False, early_stop=False, chunk_size=50, min_de
                   auc=auc, early_stop=early_stop_info)
     return df_cat, cat_importances, precision, recall, cat_model, initial_shap
 
-def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False, greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False, propagation_space=None, prop_weight_mode="uniform", selection_mode="uncertainty", early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2, seed=42):
-    needs_shap = any(s.startswith("shap") for s in propagation_space) if propagation_space else False
+def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False, greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False, propagation_space=None, prop_weight_mode="uniform", selection_mode="uncertainty", early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2, seed=42, retrain_every=1, propagation_mode="auto_greedy", prop_k=2, prop_delta=0.25):
+    if propagation_mode == "shap_box":
+        needs_shap = True
+        greedy_batching = True  # Prüfer-Regel ist Einzelfall-basiert (ein Seed pro Iteration)
+    else:
+        needs_shap = any(s.startswith("shap") for s in propagation_space) if propagation_space else False
     config = dict(timestamp=datetime.now().isoformat(timespec="seconds"),
                   training_strat=training_strat, l=l, corrected_weights=corrected_weights,
                   corrected_saved=corrected_saved, strategy=strategy,
@@ -411,7 +467,8 @@ def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corre
                   skip_retrain_on_skip=skip_retrain_on_skip, propagation_space=propagation_space,
                   prop_weight_mode=prop_weight_mode, selection_mode=selection_mode,
                   early_stop=early_stop, chunk_size=chunk_size, min_delta=min_delta,
-                  stop_patience=stop_patience, seed=seed)
+                  stop_patience=stop_patience, seed=seed, retrain_every=retrain_every,
+                  propagation_mode=propagation_mode, prop_k=prop_k, prop_delta=prop_delta)
     run = logstore.open_run(config)
     t0 = time.time()
     try:
@@ -426,7 +483,8 @@ def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corre
                 propagation_space=propagation_space, initial_shap=initial_shap,
                 prop_weight_mode=prop_weight_mode, selection_mode=selection_mode,
                 early_stop=early_stop, chunk_size=chunk_size, min_delta=min_delta,
-                stop_patience=stop_patience, seed=seed, run=run)
+                stop_patience=stop_patience, seed=seed, run=run, retrain_every=retrain_every,
+                propagation_mode=propagation_mode, prop_k=prop_k, prop_delta=prop_delta)
         else:
             df, cat_importances, precision, recall, results = retrain_catboost(
                 df, l, corrected_weights, corrected_saved, strategy,
@@ -435,10 +493,11 @@ def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corre
                 propagation_space=propagation_space, initial_shap=initial_shap,
                 prop_weight_mode=prop_weight_mode, selection_mode=selection_mode,
                 early_stop=early_stop, chunk_size=chunk_size, min_delta=min_delta,
-                stop_patience=stop_patience, seed=seed, run=run)
+                stop_patience=stop_patience, seed=seed, run=run, retrain_every=retrain_every,
+                propagation_mode=propagation_mode, prop_k=prop_k, prop_delta=prop_delta)
         run.close(wall_time_s=time.time() - t0, final_precision=precision, final_recall=recall)
         printed_run_id = run.run_id
-        test_logger(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] | run_id= {printed_run_id} | training_strat= {training_strat}, l={l}, corrected_weights = {corrected_weights}, corrected_saved = {corrected_saved}, strategy = {strategy}, greedy_batching = {greedy_batching}, greedy_T = {greedy_T}, compute_shap = {compute_shap}, skip_retrain_on_skip = {skip_retrain_on_skip}, propagation_space = {propagation_space}, prop_weight_mode = {prop_weight_mode}, selection_mode = {selection_mode}, early_stop = {early_stop}, chunk_size = {chunk_size}, min_delta = {min_delta}, stop_patience = {stop_patience}, seed = {seed}", results)
+        test_logger(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] | run_id= {printed_run_id} | training_strat= {training_strat}, l={l}, corrected_weights = {corrected_weights}, corrected_saved = {corrected_saved}, strategy = {strategy}, greedy_batching = {greedy_batching}, greedy_T = {greedy_T}, compute_shap = {compute_shap}, skip_retrain_on_skip = {skip_retrain_on_skip}, propagation_space = {propagation_space}, prop_weight_mode = {prop_weight_mode}, selection_mode = {selection_mode}, early_stop = {early_stop}, chunk_size = {chunk_size}, min_delta = {min_delta}, stop_patience = {stop_patience}, seed = {seed}, retrain_every = {retrain_every}, propagation_mode = {propagation_mode}, prop_k = {prop_k}, prop_delta = {prop_delta}", results)
     except Exception:
         run.close(wall_time_s=time.time() - t0)
         raise
@@ -459,29 +518,43 @@ if __name__ == "__main__":
     #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='incremental', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
     
     # ========================================================================
-    # TO TEST: Early-Stop (Chunked Training) - noch nicht getestete Varianten
+    # TO TEST: Lazy Retrain + Prüfer-Regel (shap_box) - greedy + shap_raw
     # ========================================================================
-    # Fokus: full retrain. Staerkste Variante = greedy_batching + shap_raw.
-    # Dazu eine non-greedy Variante als reiner Laufzeit-Vergleich.
-    # chunk_size=50 und stop_patience=2 sind fix; nur min_delta variiert.
-    # - STRICT:   min_delta=0.01   -> Training stoppt sehr schnell (~150-300 Baeume)
-    # - MODERATE: min_delta=0.001  -> laeuft haeufig bis ans Cap von 500 Baeumen
+    # 1) Lazy (retrain_every): Statt jede Iteration zu trainieren nur alle N
+    #    (Korrekturen akkumulieren dazwischen). 10 -> 10 Retrains, 50 -> 2.
+    # 2) shap_box (Prüfer-Regel): Reviewer baut aus der SHAP-Erklärung des
+    #    Seeds eine Range-Regel auf Top-k Features (vorzeichen-erhaltende Band
+    #    [v*(1-δ), v*(1+δ)]) statt auto-Kugel/Voronoi. Last-writer-wins.
+    # Anthropomorphe Baseline beider Vergleiche = auto-greedy l=100 (Referenz).
+    # Early-Stop-Vergleich (STRICT/MODERATE, l=30) -> temporär auskommentiert.
+
+    # --- greedy + shap_raw, LAZY retrain_every=10 (10 Retrains @ 10..100) ---
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=10)
+
+    # --- greedy + shap_raw, LAZY retrain_every=50 (2 Retrains @ 50,100) ---
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=50)
+
+    # --- greedy + shap_raw, auto-greedy Baseline l=100 (Referenz via Kugel/T) ---
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
+
+    # --- greedy + shap_raw, Prüfer-Regel shap_box (k=2, δ=.25, Range-Box) ---
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_k=2, prop_delta=0.25)
 
     # --- greedy + shap_raw, Baseline OFF (Referenz/Wandzeit) ---
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
+    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
 
     # --- greedy + shap_raw, early_stop STRICT ---
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], early_stop=True, chunk_size=50, min_delta=0.01, stop_patience=2)
+    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], early_stop=True, chunk_size=50, min_delta=0.01, stop_patience=2)
 
     # --- greedy + shap_raw, early_stop MODERATE ---
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], early_stop=True, chunk_size=50, min_delta=0.001, stop_patience=2)
+    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], early_stop=True, chunk_size=50, min_delta=0.001, stop_patience=2)
 
     # --- non-greedy (uncertainty) Baseline OFF, reiner Laufzeit-Vergleich ---
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin")
+    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin")
 
     # --- non-greedy, early_stop STRICT ---
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", early_stop=True, chunk_size=50, min_delta=0.01, stop_patience=2)
+    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", early_stop=True, chunk_size=50, min_delta=0.01, stop_patience=2)
 
     # --- non-greedy, early_stop MODERATE ---
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", early_stop=True, chunk_size=50, min_delta=0.001, stop_patience=2)
+    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", early_stop=True, chunk_size=50, min_delta=0.001, stop_patience=2)
     

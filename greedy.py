@@ -305,3 +305,115 @@ def greedy_iteration(df, strategy, state, selection_mode="uncertainty"):
         meta["propagation_accuracy"] = 1.0
 
     return df, state, meta
+
+
+def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
+                            prop_k=2, prop_delta=0.25):
+    """Prüfer-Regel-Propagation (shap_box): Statt Kugel/Voronoi baut der simulierte
+    Prüfer aus der SHAP-Erklärung des reviewed Seeds eine Range-Regel.
+
+    Regel: Top-k Features des Seeds nach |SHAP|; pro Feature eine vorzeichen-
+    erhaltende Band [v*(1-delta), v*(1+delta)] auf der SHAP-Achse. Propagiert wird
+    das Seed-Label auf alle Cases, deren SHAP-Werte in ALLE Bänder fallen
+    (last-writer-wins). Braucht greedy_batching=True mit shap propagation_space.
+    """
+    meta = {}
+
+    _ensure_propagation(df, state)
+    ps = state["propagation_space"]
+    if "shap_raw" in ps and state["shap_raw_indices"] is not None:
+        sel_cols = state["shap_raw_indices"]
+    elif "shap_all" in ps and state["shap_vals"] is not None:
+        sel_cols = list(range(state["shap_vals"].shape[1]))
+    elif "shap_flags" in ps and state["shap_flag_indices"] is not None:
+        sel_cols = state["shap_flag_indices"]
+    else:
+        raise ValueError("shap_box propagation_mode requires a shap propagation_space (z.B. ['shap_raw'])")
+    if state["shap_vals"] is None:
+        raise ValueError("shap_box needs shap_vals (compute_shap=True / initial_shap via run_unsupervised)")
+    S = state["shap_vals"]
+
+    df, score_col = _uncertainty_scores(df, strategy, state)
+    pool_mask = ~df["posting_id"].isin(state["directly_corrected"])
+    pool = df[pool_mask]
+    if pool.empty:
+        df = df.drop(columns=[score_col])
+        meta["type"] = "no_candidates"
+        return df, state, meta
+
+    if selection_mode == "uncertainty_density":
+        if state["T"] is None:
+            state["T"] = estimate_threshold(state)
+        if state["neighbor_density"] is None:
+            _compute_neighbor_density(state)
+        pool_idx = pool.index.values
+        uncertainty = pool[score_col].values
+        density = state["neighbor_density"][pool_idx]
+        density_max = density.max()
+        density_norm = density / density_max if density_max > 0 else density
+        combined = uncertainty * density_norm
+        m_pos = pool.index[np.argmax(combined)]
+    else:
+        m_pos = pool[score_col].idxmax()
+    M = df.loc[m_pos, "posting_id"]
+    M_label = int(df.loc[m_pos, "label"])
+    df = df.drop(columns=[score_col])
+
+    # Regel bauen: Top-k |SHAP| Features des Seeds, vorzeichen-erhaltende Bänder
+    M_idx = np.where(state["X_ids"] == M)[0][0]
+    row = S[M_idx, sel_cols]
+    k = min(prop_k, len(sel_cols))
+    topk = np.argsort(-np.abs(row))[:k]
+    d = min(prop_delta, 0.99)
+    col_idx = [sel_cols[t] for t in topk]
+    bands = []
+    for j in col_idx:
+        v = float(S[M_idx, j])
+        if v == 0.0:
+            lo, hi = -1e-9, 1e-9
+        else:
+            lo, hi = sorted((v * (1.0 - d), v * (1.0 + d)))
+        bands.append((lo, hi))
+
+    mask = np.ones(len(df), dtype=bool)
+    for j, (lo, hi) in zip(col_idx, bands):
+        col = S[:, j]
+        mask &= (col >= lo) & (col <= hi)
+    if not mask.any():
+        mask[M_idx] = True  # Fallback: mindestens der Seed selbst
+
+    prev_pred = df["pred_label"].values.copy()
+    covered_idxs = np.where(mask)[0]
+    if len(covered_idxs):
+        df.loc[df.index[covered_idxs], "pred_label"] = M_label
+
+    ids = state["X_ids"]
+    state["covered"] |= set(ids[mask])
+    state["directly_corrected"].add(M)
+    state["covered_arr"] = mask
+    state["nearest_dist"] = None
+
+    changed = df["pred_label"].values != prev_pred
+    all_features = get_feature_cols(df)
+    meta["M"] = M
+    meta["M_label"] = M_label
+    meta["type"] = "skip" if not bool(changed.any()) else "rule"
+    meta["rule"] = {
+        "features": [all_features[j] for j in col_idx],
+        "bands": [[lo, hi] for lo, hi in bands],
+        "k": k,
+        "delta": prop_delta,
+    }
+    meta["n_covered"] = len(covered_idxs)
+    meta["cumulative_direct"] = len(state["directly_corrected"])
+    meta["n_flipped"] = int(changed.sum())
+    meta["prop_dims"] = len(sel_cols)
+    meta["selection_mode"] = selection_mode
+    meta["M_density"] = float(state["neighbor_density"][M_idx]) if state["neighbor_density"] is not None else 0.0
+    if len(covered_idxs):
+        acc = (df.loc[df.index[covered_idxs], "label"].values == M_label).mean()
+        meta["propagation_accuracy"] = float(acc)
+    else:
+        meta["propagation_accuracy"] = 1.0
+
+    return df, state, meta
