@@ -497,7 +497,7 @@ def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corre
                 propagation_mode=propagation_mode, prop_k=prop_k, prop_delta=prop_delta)
         run.close(wall_time_s=time.time() - t0, final_precision=precision, final_recall=recall)
         printed_run_id = run.run_id
-        test_logger(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] | run_id= {printed_run_id} | training_strat= {training_strat}, l={l}, corrected_weights = {corrected_weights}, corrected_saved = {corrected_saved}, strategy = {strategy}, greedy_batching = {greedy_batching}, greedy_T = {greedy_T}, compute_shap = {compute_shap}, skip_retrain_on_skip = {skip_retrain_on_skip}, propagation_space = {propagation_space}, prop_weight_mode = {prop_weight_mode}, selection_mode = {selection_mode}, early_stop = {early_stop}, chunk_size = {chunk_size}, min_delta = {min_delta}, stop_patience = {stop_patience}, seed = {seed}, retrain_every = {retrain_every}, propagation_mode = {propagation_mode}, prop_k = {prop_k}, prop_delta = {prop_delta}", results)
+        test_logger(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] | run_id= {printed_run_id} | training_strat= {training_strat}, l={l}, corrected_weights = {corrected_weights}, corrected_saved = {corrected_saved}, strategy = {strategy}, greedy_batching = {greedy_batching}, greedy_T = {greedy_T}, compute_shap = {needs_shap}, skip_retrain_on_skip = {skip_retrain_on_skip}, propagation_space = {propagation_space}, prop_weight_mode = {prop_weight_mode}, selection_mode = {selection_mode}, early_stop = {early_stop}, chunk_size = {chunk_size}, min_delta = {min_delta}, stop_patience = {stop_patience}, seed = {seed}, retrain_every = {retrain_every}, propagation_mode = {propagation_mode}, prop_k = {prop_k}, prop_delta = {prop_delta}", results)
     except Exception:
         run.close(wall_time_s=time.time() - t0)
         raise
@@ -518,27 +518,24 @@ if __name__ == "__main__":
     #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='incremental', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
     
     # ========================================================================
-    # TO TEST: Lazy Retrain + Prüfer-Regel (shap_box) - greedy + shap_raw
+    # TO TEST: Prüfer-Regel (shap_box) l=500, absolut - greedy + shap_raw
     # ========================================================================
-    # 1) Lazy (retrain_every): Statt jede Iteration zu trainieren nur alle N
-    #    (Korrekturen akkumulieren dazwischen). 10 -> 10 Retrains, 50 -> 2.
-    # 2) shap_box (Prüfer-Regel): Reviewer baut aus der SHAP-Erklärung des
-    #    Seeds eine Range-Regel auf Top-k Features (vorzeichen-erhaltende Band
-    #    [v*(1-δ), v*(1+δ)]) statt auto-Kugel/Voronoi. Last-writer-wins.
-    # Anthropomorphe Baseline beider Vergleiche = auto-greedy l=100 (Referenz).
-    # Early-Stop-Vergleich (STRICT/MODERATE, l=30) -> temporär auskommentiert.
+    # Aktiv: shap_box l=500 (k=2, δ=0.25), retrain_every=1 (absolut).
+    # Vergleich gegen existierende Baseline greedy+shap_raw l=500 (P=0.664).
+    # Keine Parameter-Anpassung an Ergebnissen -> siehe PROJECT_CONTEXT §9.
+    # Referenz: die 4 gelaufenen l=100-Runs sind auskommentiert.
 
-    # --- greedy + shap_raw, LAZY retrain_every=10 (10 Retrains @ 10..100) ---
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=10)
+    # --- greedy + shap_raw, Prüfer-Regel shap_box l=500, absolut ---
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_k=2, prop_delta=0.25)
 
-    # --- greedy + shap_raw, LAZY retrain_every=50 (2 Retrains @ 50,100) ---
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=50)
+    # ================ Referenz: 4 gelaufene l=100-Runs ================
+    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=10)
 
-    # --- greedy + shap_raw, auto-greedy Baseline l=100 (Referenz via Kugel/T) ---
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
+    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=50)
 
-    # --- greedy + shap_raw, Prüfer-Regel shap_box (k=2, δ=.25, Range-Box) ---
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_k=2, prop_delta=0.25)
+    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
+
+    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_k=2, prop_delta=0.25)
 
     # --- greedy + shap_raw, Baseline OFF (Referenz/Wandzeit) ---
     # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
