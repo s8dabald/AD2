@@ -308,14 +308,29 @@ def greedy_iteration(df, strategy, state, selection_mode="uncertainty"):
 
 
 def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
-                            prop_k=2, prop_delta=0.25):
-    """Prüfer-Regel-Propagation (shap_box): Statt Kugel/Voronoi baut der simulierte
-    Prüfer aus der SHAP-Erklärung des reviewed Seeds eine Range-Regel.
+                            prop_k=2, prop_delta=0.25, feature_space="off"):
+    """Prüfer-Regel-Propagation (shap_box, adaptive Feature-Selektion): Statt
+    Kugel/Voronoi baut der simulierte Prüfer aus der SHAP-Erklärung des reviewed
+    Seeds eine Regel in zwei Ebenen.
 
-    Regel: Top-k Features des Seeds nach |SHAP|; pro Feature eine vorzeichen-
-    erhaltende Band [v*(1-delta), v*(1+delta)] auf der SHAP-Achse. Propagiert wird
-    das Seed-Label auf alle Cases, deren SHAP-Werte in ALLE Bänder fallen
-    (last-writer-wins). Braucht greedy_batching=True mit shap propagation_space.
+    Decision Space: Adaptive Auswahl der SHAP-Features, die den Fall entschieden
+    haben (echte, vorzeichenbehaftete Werte kumuliert ab Baseline; Prefix bis zum
+    LETZTEN Überqueren der Logit-0 — danach kann der echte Rest das Urteil nicht
+    mehr kippen). Kein festes k, keine Betragssummen. Um diese Features werden
+    vorzeichen-erhaltende Bänder [v*(1-delta), v*(1+delta)] gezogen.
+
+    Feature Space (Keyword `feature_space`):
+      - "off": kein Wettere Filter (Verhalten wie bisheriges shap_box).
+      - "value_box": alle Original-Features (features_raw) müssen innerhalb
+        ±prop_delta um die Seed-Werte liegen.
+      - "perfect_knowledge": Werte-Bänder aus den Family-Mitgliedern, deren
+        echtes Label == Prüfer-Urteil über den Seed (min-max pro Original-Feature).
+        Simuliert den Prüfer mit perfekter Kenntnis des gültigen Wertebereichs.
+
+    Propagiert wird das Seed-Label auf die finalen Cases (last-writer-wins). Ist
+    die Region leer, wird nur der Seed selbst korrigiert. Prüfer-Urteil/True Labels
+    fließen NUR bei feature_space="perfect_knowledge" ein — nie in die SHAP-Auswahl.
+    Braucht greedy_batching=True mit shap propagation_space.
     """
     meta = {}
 
@@ -357,30 +372,88 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
         m_pos = pool[score_col].idxmax()
     M = df.loc[m_pos, "posting_id"]
     M_label = int(df.loc[m_pos, "label"])
+    M_pred_score = float(df.loc[m_pos, "pred_score"])
+    M_pred_label = int(df.loc[m_pos, "pred_label"])
     df = df.drop(columns=[score_col])
 
-    # Regel bauen: Top-k |SHAP| Features des Seeds, vorzeichen-erhaltende Bänder
+    # ---- Decision Space: adaptive entscheidende SHAP-Features (echte Werte).
+    # Baseline = Logit - Summe der SHAP-Beiträge im Zielfeatures-Raum; daraus
+    # kumulieren (vorzeichenbehaftet) und das LETZTE Überqueren der Logit-0
+    # bestimmen. Danach kann der echte Rest das Vorzeichen nicht mehr kippen.
     M_idx = np.where(state["X_ids"] == M)[0][0]
     row = S[M_idx, sel_cols]
-    k = min(prop_k, len(sel_cols))
-    topk = np.argsort(-np.abs(row))[:k]
+    p = min(max(M_pred_score, 1e-7), 1.0 - 1e-7)
+    logit = float(np.log(p / (1.0 - p)))
+    base = logit - float(row.sum())
+    order = np.argsort(-np.abs(row))
+    cum = base + np.cumsum(row[order])
+    tol = 1e-9 * max(1.0, abs(logit))
+    side = np.where(cum >= tol, 1, -1)
+    final = side[-1] if len(side) else 0
+    dev = np.where(side != final)[0]
+    if len(dev):
+        k = int(dev[-1]) + 2  # Prefix bis einschließlich des Features, das die Endseite fixiert
+    else:
+        k = 0  # Entscheidung steht schon bei der Baseline: keine Familie
+    k = int(min(k, len(sel_cols)))
     d = min(prop_delta, 0.99)
-    col_idx = [sel_cols[t] for t in topk]
-    bands = []
-    for j in col_idx:
-        v = float(S[M_idx, j])
-        if v == 0.0:
-            lo, hi = -1e-9, 1e-9
-        else:
-            lo, hi = sorted((v * (1.0 - d), v * (1.0 + d)))
-        bands.append((lo, hi))
 
-    mask = np.ones(len(df), dtype=bool)
-    for j, (lo, hi) in zip(col_idx, bands):
-        col = S[:, j]
-        mask &= (col >= lo) & (col <= hi)
-    if not mask.any():
-        mask[M_idx] = True  # Fallback: mindestens der Seed selbst
+    mask = np.zeros(len(df), dtype=bool)
+    family_size = 1
+    col_idx = []
+    bands = []
+    value_bands = None
+    if k >= 1:
+        topk = order[:k]
+        col_idx = [sel_cols[t] for t in topk]
+        bands = []
+        for j in col_idx:
+            v = float(S[M_idx, j])
+            if v == 0.0:
+                lo, hi = -1e-9, 1e-9
+            else:
+                lo, hi = sorted((v * (1.0 - d), v * (1.0 + d)))
+            bands.append((lo, hi))
+
+        mask = np.ones(len(df), dtype=bool)
+        for j, (lo, hi) in zip(col_idx, bands):
+            col = S[:, j]
+            mask &= (col >= lo) & (col <= hi)
+        if not mask.any():
+            mask[M_idx] = True  # Fallback: mindestens der Seed selbst
+        family_size = int(mask.sum())
+
+        # ---- Feature Space: alle Original-Features (features_raw), ohne Flags.
+        if feature_space in ("value_box", "perfect_knowledge"):
+            raw = _get_feature_groups(df)["features_raw"]
+            if feature_space == "value_box":
+                value_bands = []
+                for f in raw:
+                    v = float(df.loc[m_pos, f])
+                    if v == 0.0:
+                        lo, hi = -1e-9, 1e-9
+                    else:
+                        lo, hi = sorted((v * (1.0 - d), v * (1.0 + d)))
+                    value_bands.append((f, lo, hi))
+                    val = df[f].values
+                    mask &= (val >= lo) & (val <= hi)
+            else:  # perfect_knowledge: Bänder aus Family-Mitgliedern mit Seed-Urteil
+                labels = df["label"].values.astype(int)
+                sub = mask & (labels == M_label)
+                if sub.any():
+                    value_bands = []
+                    for f in raw:
+                        vals = df.loc[df.index[sub], f].values
+                        lo, hi = float(vals.min()), float(vals.max())
+                        value_bands.append((f, lo, hi))
+                        val = df[f].values
+                        mask &= (val >= lo - 1e-12) & (val <= hi + 1e-12)
+        if not mask.any():
+            mask = np.zeros(len(df), dtype=bool)
+            mask[M_idx] = True  # Fallback: nur der Seed
+    else:
+        # k==0: Entscheidung steht bereits an der Baseline -> keine Familie, nur Seed
+        mask[M_idx] = True
 
     prev_pred = df["pred_label"].values.copy()
     covered_idxs = np.where(mask)[0]
@@ -397,13 +470,18 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
     all_features = get_feature_cols(df)
     meta["M"] = M
     meta["M_label"] = M_label
+    meta["M_pred_score"] = M_pred_score
+    meta["M_pred_label"] = M_pred_label
     meta["type"] = "skip" if not bool(changed.any()) else "rule"
     meta["rule"] = {
         "features": [all_features[j] for j in col_idx],
         "bands": [[lo, hi] for lo, hi in bands],
         "k": k,
         "delta": prop_delta,
+        "feature_space": feature_space,
+        "family_size": family_size,
     }
+    meta["value_bands"] = value_bands
     meta["n_covered"] = len(covered_idxs)
     meta["cumulative_direct"] = len(state["directly_corrected"])
     meta["n_flipped"] = int(changed.sum())
