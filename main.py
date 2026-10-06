@@ -110,6 +110,23 @@ def _compute_sample_weights(df, state, prop_weight_mode, corrected_weights):
         sample_weights[idx] = corrected_weights
     return sample_weights
 
+def _retrain_guard_ok(df, state, min_reviews=15):
+    """
+    Guard before retrain:
+    - at least min_reviews Prüfer-Korrekturen (directly_corrected) müssen existieren, und
+    - das Trainingsziel df["pred_label"] muss beide Klassen (0 und 1) enthalten,
+      damit CatBoost nicht mit "All train targets are equal" abstürzt.
+    """
+    # 1. Mind. min_reviews Prüfer-Korrekturen
+    if len(state.get("directly_corrected", set())) < min_reviews:
+        return False
+    # 2. Beide Klassen im Trainingsziel vorhanden?
+    if df["pred_label"].nunique() < 2:
+        return False
+    return True
+
+
+
 def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, strategy="entropy",
                      greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False,
                      propagation_space=None, initial_shap=None,
@@ -172,7 +189,7 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
             skip_retrain = False
         query_s = time.time() - t_q
 
-        should_retrain = ((i + 1) % retrain_every == 0) and not skip_retrain
+        should_retrain = ((i + 1) % retrain_every == 0) and not skip_retrain and _retrain_guard_ok(df, state, min_reviews=15)
         if not should_retrain:
             if skip_retrain:
                 print(f"Skip-Retrain (keine Labeländerung) | "
@@ -342,7 +359,7 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
             skip_retrain = False
         query_s = time.time() - t_q
 
-        should_retrain = ((i + 1) % retrain_every == 0) and not skip_retrain
+        should_retrain = ((i + 1) % retrain_every == 0) and not skip_retrain and _retrain_guard_ok(df, state, min_reviews=15)
         if not should_retrain:
             if skip_retrain:
                 print(f"Skip-Retrain (keine Labeländerung) | "
@@ -550,7 +567,7 @@ if __name__ == "__main__":
     #   "value_box" / "perfect_knowledge" (siehe §4 Decision 12).
     # Keine Parameter-Anpassung an Ergebnissen -> siehe PROJECT_CONTEXT §9.
 
-    # --- cluster_baskets, l=500, margin, retrain_every=1 ---
+    # --- cluster_baskets, l=500, margin, retrain_every=15 ---
     df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="cluster_baskets", basket_alpha=0.5)
     # --- adaptive shap_box, feature_space=value_box, l=500, absolut ---
     # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_delta=0.25, feature_space="value_box")
