@@ -54,6 +54,18 @@ def _uncertainty_distribution(df, strategy, novelty_cache=None, buckets=_UNC_BUC
         "n_cases": int(pop),
     }
 
+
+def _print_basket_summary(iteration, meta):
+    print(f"Baskets nach Iteration {iteration}:")
+    for basket in meta.get("baskets", []):
+        print(
+            f"  basket={basket['id']} oracle_id={basket['oracle_id']} "
+            f"name={basket['name'] or '-'} label={basket['label']} "
+            f"total={basket['total']} reviewed={basket['reviewed']} "
+            f"propagated={basket['propagated']}"
+        )
+
+
 def _drive_results_path():
     """Drive-Pfad der Ergebnisdatei auf Colab, sonst None."""
     if os.path.isdir("/content/drive/MyDrive"):
@@ -169,11 +181,18 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
                 from greedy import cluster_baskets_iteration
                 df, state, meta = cluster_baskets_iteration(df, strategy, state, selection_mode=selection_mode,
                                                             basket_alpha=basket_alpha)
+            elif propagation_mode == "cluster_baskets_oracle":
+                from greedy import cluster_baskets_oracle_iteration
+                df, state, meta = cluster_baskets_oracle_iteration(
+                    df, strategy, state, selection_mode=selection_mode,
+                    basket_alpha=basket_alpha)
             else:
                 df, state, meta = greedy_iteration(df, strategy, state, selection_mode=selection_mode)
             if meta.get("type") == "no_candidates":
                 print("No more candidates in pool.")
                 break
+            if propagation_mode in ("cluster_baskets", "cluster_baskets_oracle"):
+                _print_basket_summary(i + 1, meta)
             corrected_ids = list(state["directly_corrected"] | state["covered"])
             skip_retrain = skip_retrain_on_skip and meta.get("type") == "skip"
         else:
@@ -224,8 +243,10 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
                     r = meta.get("rule") or {}
                     band_str = ", ".join(f"{f} ∈ [{lo:.4f},{hi:.4f}]" for f, (lo, hi)
                                          in zip(r.get("features", []), r.get("bands", [])))
+                    prop_acc = meta.get("propagation_accuracy")
+                    prop_acc_str = f"{prop_acc:.4f}" if prop_acc is not None else "N/A"
                     print(f"REVIEWER-RULE ({meta.get('type')}): {band_str} → {meta.get('n_covered')} Cases "
-                          f"(acc={meta.get('propagation_accuracy'):.4f}, flipped={meta.get('n_flipped')}, "
+                          f"(acc={prop_acc_str}, flipped={meta.get('n_flipped')}, "
                           f"fs={feature_space}, family={meta.get('rule', {}).get('family_size')})")
                 else:
                     print(f"type={meta.get('type')}, centers={meta.get('n_centers')}, "
@@ -280,12 +301,16 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
                 r = meta.get("rule") or {}
                 band_str = ", ".join(f"{f}∈[{lo:.4f},{hi:.4f}]" for f, (lo, hi)
                                      in zip(r.get("features", []), r.get("bands", [])))
+                prop_acc = meta.get("propagation_accuracy")
+                prop_acc_str = f"{prop_acc:.4f}" if prop_acc is not None else "N/A"
                 extra = (f", type={meta.get('type')}, rule=[{band_str}], covered={meta.get('n_covered')}, "
-                         f"flipped={meta.get('n_flipped')}, prop_acc={meta.get('propagation_accuracy'):.4f}")
+                         f"flipped={meta.get('n_flipped')}, prop_acc={prop_acc_str}")
             elif greedy_batching:
+                prop_acc = meta.get("propagation_accuracy")
+                prop_acc_str = f"{prop_acc:.4f}" if prop_acc is not None else "N/A"
                 extra = (f", type={meta.get('type')}, centers={meta.get('n_centers')}, "
                          f"covered={meta.get('n_covered')}, cum_direct={meta.get('cumulative_direct')}, "
-                         f"flipped={meta.get('n_flipped')}, prop_acc={meta.get('propagation_accuracy'):.4f}, "
+                         f"flipped={meta.get('n_flipped')}, prop_acc={prop_acc_str}, "
                          f"T={state['T']:.4f}, prop_dims={meta.get('prop_dims')}, "
                          f"weight_mode={prop_weight_mode}, sel_mode={selection_mode}")
             else:
@@ -339,11 +364,18 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
                 from greedy import cluster_baskets_iteration
                 df, state, meta = cluster_baskets_iteration(df, strategy, state, selection_mode=selection_mode,
                                                             basket_alpha=basket_alpha)
+            elif propagation_mode == "cluster_baskets_oracle":
+                from greedy import cluster_baskets_oracle_iteration
+                df, state, meta = cluster_baskets_oracle_iteration(
+                    df, strategy, state, selection_mode=selection_mode,
+                    basket_alpha=basket_alpha)
             else:
                 df, state, meta = greedy_iteration(df, strategy, state, selection_mode=selection_mode)
             if meta.get("type") == "no_candidates":
                 print("No more candidates in pool.")
                 break
+            if propagation_mode in ("cluster_baskets", "cluster_baskets_oracle"):
+                _print_basket_summary(i + 1, meta)
             corrected_ids = list(state["directly_corrected"] | state["covered"])
             skip_retrain = skip_retrain_on_skip and meta.get("type") == "skip"
         else:
@@ -397,8 +429,10 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
                     r = meta.get("rule") or {}
                     band_str = ", ".join(f"{f} ∈ [{lo:.4f},{hi:.4f}]" for f, (lo, hi)
                                          in zip(r.get("features", []), r.get("bands", [])))
+                    prop_acc = meta.get("propagation_accuracy")
+                    prop_acc_str = f"{prop_acc:.4f}" if prop_acc is not None else "N/A"
                     print(f"REVIEWER-RULE ({meta.get('type')}): {band_str} → {meta.get('n_covered')} Cases "
-                          f"(acc={meta.get('propagation_accuracy'):.4f}, flipped={meta.get('n_flipped')}, "
+                          f"(acc={prop_acc_str}, flipped={meta.get('n_flipped')}, "
                           f"fs={feature_space}, family={meta.get('rule', {}).get('family_size')})")
                 else:
                     print(f"type={meta.get('type')}, centers={meta.get('n_centers')}, "
@@ -448,19 +482,39 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
             base = (f"Iteration: {i+1}, Precision: {precision:.4f}, Recall: {recall:.4f}, Trees: {trees_this}, "
                     f"TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
             if skip_retrain:
+
                 extra = ", type=skip (retrain skipped)"
+
             elif greedy_batching and propagation_mode == "shap_box":
+
                 r = meta.get("rule") or {}
-                band_str = ", ".join(f"{f}∈[{lo:.4f},{hi:.4f}]" for f, (lo, hi)
-                                     in zip(r.get("features", []), r.get("bands", [])))
-                extra = (f", type={meta.get('type')}, rule=[{band_str}], covered={meta.get('n_covered')}, "
-                         f"flipped={meta.get('n_flipped')}, prop_acc={meta.get('propagation_accuracy'):.4f}")
+                band_str = ", ".join(
+                    f"{f}∈[{lo:.4f},{hi:.4f}]"
+                    for f, (lo, hi) in zip(r.get("features", []), r.get("bands", []))
+                )
+
+                prop_acc = meta.get("propagation_accuracy")
+                prop_acc_str = f"{prop_acc:.4f}" if prop_acc is not None else "N/A"
+
+                extra = (
+                    f", type={meta.get('type')}, rule=[{band_str}], "
+                    f"covered={meta.get('n_covered')}, "
+                    f"flipped={meta.get('n_flipped')}, "
+                    f"prop_acc={prop_acc_str}"
+                )
+
             elif greedy_batching:
-                extra = (f", type={meta.get('type')}, centers={meta.get('n_centers')}, "
-                         f"covered={meta.get('n_covered')}, cum_direct={meta.get('cumulative_direct')}, "
-                         f"flipped={meta.get('n_flipped')}, prop_acc={meta.get('propagation_accuracy'):.4f}, "
-                         f"T={state['T']:.4f}, prop_dims={meta.get('prop_dims')}, "
-                         f"weight_mode={prop_weight_mode}, sel_mode={selection_mode}")
+
+                prop_acc = meta.get("propagation_accuracy")
+                prop_acc_str = f"{prop_acc:.4f}" if prop_acc is not None else "N/A"
+
+                extra = (
+                    f", type={meta.get('type')}, centers={meta.get('n_centers')}, "
+                    f"covered={meta.get('n_covered')}, cum_direct={meta.get('cumulative_direct')}, "
+                    f"flipped={meta.get('n_flipped')}, prop_acc={prop_acc_str}, "
+                    f"T={state['T']:.4f}, prop_dims={meta.get('prop_dims')}, "
+                    f"weight_mode={prop_weight_mode}, sel_mode={selection_mode}"
+                )
             else:
                 extra = f", Misspredicted: {meta.get('misspredicted')}"
             results.append(base + extra)
@@ -493,7 +547,7 @@ def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corre
     if propagation_mode == "shap_box":
         needs_shap = True
         greedy_batching = True  # Prüfer-Regel ist Einzelfall-basiert (ein Seed pro Iteration)
-    elif propagation_mode == "cluster_baskets":
+    elif propagation_mode in ("cluster_baskets", "cluster_baskets_oracle"):
         needs_shap = True
         greedy_batching = True
     else:
@@ -568,7 +622,9 @@ if __name__ == "__main__":
     # Keine Parameter-Anpassung an Ergebnissen -> siehe PROJECT_CONTEXT §9.
 
     # --- cluster_baskets, l=500, margin, retrain_every=15 ---
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="cluster_baskets", basket_alpha=0.5)
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=15, propagation_mode="cluster_baskets", basket_alpha=0.5)
+    # Alternative: feste Oracle-Centroids statt organisch gemittelter Basket-Centroids.
+    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=15, propagation_mode="cluster_baskets_oracle", basket_alpha=0.5)
     # --- adaptive shap_box, feature_space=value_box, l=500, absolut ---
     # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_delta=0.25, feature_space="value_box")
 
