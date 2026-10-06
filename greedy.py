@@ -1,4 +1,6 @@
+import os
 import numpy as np
+import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 from querystep import margin_uncertainty, entropy_uncertainty, novelty_uncertainty
@@ -65,11 +67,22 @@ def new_state(T=None, propagation_space=None):
         "shap_flag_indices": None,
         # matrix cache
         "prop_matrix": None,
-        "prop_matrix_shap_id": None,
-        # selection / weighting
-        "nearest_dist": None,
-        "neighbor_density": None,
-    }
+    "prop_matrix_shap_id": None,
+    # selection / weighting
+    "nearest_dist": None,
+    "neighbor_density": None,
+    # cluster_baskets
+    "pipeline_baskets": [],
+    "case_to_basket": {},
+    "case_source": {},
+    "basket_counter": 0,
+    "shap_scaler": None,
+    "shap_std_cache": None,
+    "shap_std_id": None,
+    "_ideal_map": None,
+    "_ideal_names": None,
+}
+
 
 
 def _ensure_propagation(df, state):
@@ -77,7 +90,6 @@ def _ensure_propagation(df, state):
     groups = _get_feature_groups(df)
     ps = state["propagation_space"]
     n = len(df)
-
     # Scale feature groups on first call, then reuse
     if "features_all" in ps and state["prop_scaled"] is None:
         state["prop_scaled"] = StandardScaler().fit_transform(df[groups["features_all"]].values)
@@ -494,4 +506,210 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
     else:
         meta["propagation_accuracy"] = 1.0
 
+    return df, state, meta
+
+
+# --- Cluster Baskets helpers ---
+
+# --- Cluster Baskets helpers ---
+
+_IDEAL_MAP = None
+_IDEAL_NAMES = None
+
+
+def _load_ideal():
+    global _IDEAL_MAP, _IDEAL_NAMES
+    if _IDEAL_MAP is not None:
+        return _IDEAL_MAP, _IDEAL_NAMES
+    ideal_path = "probe_out/ideal_membership.csv"
+    if os.path.exists(ideal_path):
+        try:
+            dfm = pd.read_csv(ideal_path)
+            _IDEAL_MAP = {str(r["posting_id"]): (int(r["cluster"]), int(r["label"]))
+                          for _, r in dfm.iterrows()}
+        except Exception:
+            _IDEAL_MAP = {}
+    else:
+        _IDEAL_MAP = {}
+    names_path = "probe_out/ideal_baskets_centroids_std.csv"
+    if os.path.exists(names_path):
+        try:
+            dfn = pd.read_csv(names_path)
+            _IDEAL_NAMES = {int(r["basket_id"]): (str(r.get("basket_name", "")) if pd.notna(r.get("basket_name", "")) else "",
+                                                  int(r["label"]) if "label" in r else 0)
+                            for _, r in dfn.iterrows()}
+        except Exception:
+            _IDEAL_NAMES = {}
+    else:
+        _IDEAL_NAMES = {}
+    return _IDEAL_MAP, _IDEAL_NAMES
+
+
+def _oracle_basket_for(pid):
+    m, n = _load_ideal()
+    k = str(pid)
+    if k not in m:
+        return None, None, ""
+    bid, lbl = m[k]
+    name = ""
+    if n and bid in n:
+        name = n[bid][0] or ""
+    return bid, lbl, name
+
+
+def _ensure_shap_std(state, S_raw, ids):
+    if S_raw is None:
+        return None
+    if state["shap_std_cache"] is not None and state["shap_std_id"] == id(state["shap_vals"]):
+        return state["shap_std_cache"]
+    if state["shap_scaler"] is None:
+        sc = StandardScaler()
+        state["shap_scaler"] = sc.fit(S_raw)
+    S_std = state["shap_scaler"].transform(S_raw)
+    state["shap_std_cache"] = S_std
+    state["shap_std_id"] = id(state["shap_vals"])
+    return S_std
+
+
+def _get_or_create_pipeline_basket(state, ideal_bid, ideal_label, ideal_name):
+    for b in state["pipeline_baskets"]:
+        if b["ideal_bid"] == ideal_bid:
+            return b
+    b = {
+        "id": state["basket_counter"],
+        "ideal_bid": ideal_bid,
+        "label": ideal_label,
+        "name": ideal_name,
+        "centroid_std": None,
+        "reviewed_ids": set(),
+    }
+    state["basket_counter"] += 1
+    state["pipeline_baskets"].append(b)
+    return b
+
+
+def _update_basket_centroids(state, S_std, ids):
+    if S_std is None:
+        return
+    id_to_idx = {pid: i for i, pid in enumerate(ids)}
+    for b in state["pipeline_baskets"]:
+        if len(b["reviewed_ids"]) == 0:
+            continue
+        idxs = [id_to_idx[pid] for pid in b["reviewed_ids"] if pid in id_to_idx]
+        if idxs:
+            b["centroid_std"] = S_std[idxs].mean(axis=0)
+
+
+def _assign_unreviewed(state, S_std, ids):
+    if S_std is None or len(state["pipeline_baskets"]) == 0:
+        return
+    id_to_idx = {pid: i for i, pid in enumerate(ids)}
+    # ensure centroids exist (fallback to zero if empty)
+    for b in state["pipeline_baskets"]:
+        if b["centroid_std"] is None:
+            b["centroid_std"] = np.zeros(S_std.shape[1])
+    # build centroids matrix
+    cents = np.stack([b["centroid_std"] for b in state["pipeline_baskets"]], axis=0)
+    b_ids = [b["id"] for b in state["pipeline_baskets"]]
+    for i, pid in enumerate(ids):
+        src = state["case_source"].get(str(pid))
+        if src == "reviewed":
+            continue
+        d = ((S_std[i] - cents) ** 2).sum(axis=1)
+        j = int(np.argmin(d))
+        state["case_to_basket"][str(pid)] = b_ids[j]
+        state["case_source"][str(pid)] = "propagated"
+
+
+def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty", basket_alpha=0.5):
+    meta = {}
+
+    _ensure_propagation(df, state)
+    ps = state["propagation_space"]
+    if "shap_raw" in ps and state["shap_raw_indices"] is not None:
+        sel_cols = state["shap_raw_indices"]
+    elif "shap_all" in ps and state["shap_vals"] is not None:
+        sel_cols = list(range(state["shap_vals"].shape[1]))
+    elif "shap_flags" in ps and state["shap_flag_indices"] is not None:
+        sel_cols = state["shap_flag_indices"]
+    else:
+        raise ValueError("cluster_baskets requires shap propagation_space")
+    if state["shap_vals"] is None:
+        raise ValueError("cluster_baskets needs shap_vals")
+
+    S_raw = state["shap_vals"][:, sel_cols]
+    ids = state["X_ids"]
+    S_std = _ensure_shap_std(state, S_raw, ids)
+
+    df, score_col = _uncertainty_scores(df, strategy, state)
+    pool_mask = ~df["posting_id"].isin(state["directly_corrected"]) if False else True  # reviewed excluded from selection? reviewed are directly_corrected
+    pool_mask = ~df["posting_id"].astype(str).isin([str(p) for p in state.get("directly_corrected", set())]) if False else ~np.isin(df["posting_id"], list(state.get("directly_corrected", set())))
+    # easier: exclude reviewed
+    reviewed_set = set(str(pid) for pid in state.get("directly_corrected", set()))
+    pool = df[~df["posting_id"].astype(str).isin(reviewed_set)]
+
+    if pool.empty:
+        df = df.drop(columns=[score_col])
+        meta["type"] = "no_candidates"
+        return df, state, meta
+
+    # compute basket_fit: dist to assigned basket
+    if S_std is not None and len(state["pipeline_baskets"]) > 0:
+        id_to_idx = {pid: i for i, pid in enumerate(ids)}
+        cents = np.stack([b["centroid_std"] for b in state["pipeline_baskets"]], axis=0)
+        b_ids_list = [b["id"] for b in state["pipeline_baskets"]]
+        # map id->basket
+        id_to_b = state["case_to_basket"]
+        d_to_b = np.full(len(ids), np.inf)
+        for i, pid in enumerate(ids):
+            bid = id_to_b.get(str(pid))
+            if bid is not None:
+                j = b_ids_list.index(bid) if bid in b_ids_list else 0
+                d_to_b[i] = ((S_std[i] - cents[j]) ** 2).sum() ** 0.5
+    else:
+        d_to_b = np.zeros(len(ids))
+
+    pool_idx = pool.index.values
+    u = pool[score_col].values
+    bf = d_to_b[pool.index.values]
+    bf_max = bf.max() if bf.size else 1.0
+    bf_n = bf / bf_max if bf_max > 0 else bf
+    combined = basket_alpha * u + (1.0 - basket_alpha) * bf_n
+    m_pos = pool.index[np.argmax(combined)]
+    M = df.loc[m_pos, "posting_id"]
+    M_str = str(M)
+
+    # determine basket from ideal
+    ideal_bid, ideal_label, ideal_name = _oracle_basket_for(M)
+    if ideal_bid is None:
+        ideal_bid, ideal_label, ideal_name = 0, int(df.loc[m_pos, "label"]), ""
+
+    pb = _get_or_create_pipeline_basket(state, ideal_bid, ideal_label, ideal_name)
+    # mark reviewed
+    pb["reviewed_ids"].add(M_str)
+    state["directly_corrected"].add(M)
+    state["case_to_basket"][M_str] = pb["id"]
+    state["case_source"][M_str] = "reviewed"
+
+    _update_basket_centroids(state, S_std, ids)
+    _assign_unreviewed(state, S_std, ids)
+
+    # propagate labels
+    prev_pred = df["pred_label"].values.copy()
+    bid_to_label = {b["id"]: b["label"] for b in state["pipeline_baskets"]}
+    for i, pid in enumerate(ids):
+        bid = state["case_to_basket"].get(str(pid))
+        if bid is not None and bid in bid_to_label:
+            df.loc[df.index[i], "pred_label"] = bid_to_label[bid]
+
+    changed = df["pred_label"].values != prev_pred
+    state["covered"] = set(ids)  # all assigned conceptually
+    meta["M"] = M
+    meta["type"] = "basket_add" if len(pb["reviewed_ids"]) == 1 else "basket_update"
+    meta["n_baskets"] = len(state["pipeline_baskets"])
+    meta["n_reviewed"] = len(state["directly_corrected"])
+    meta["n_propagated"] = sum(1 for s in state["case_source"].values() if s == "propagated")
+    meta["n_flipped"] = int(changed.sum())
+
+    df = df.drop(columns=[score_col])
     return df, state, meta

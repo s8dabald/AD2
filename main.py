@@ -147,6 +147,10 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
                 df, state, meta = reviewer_rule_propagate(df, strategy, state, selection_mode=selection_mode,
                                                           prop_k=prop_k, prop_delta=prop_delta,
                                                           feature_space=feature_space)
+            elif propagation_mode == "cluster_baskets":
+                from greedy import cluster_baskets_iteration
+                df, state, meta = cluster_baskets_iteration(df, strategy, state, selection_mode=selection_mode,
+                                                            basket_alpha=basket_alpha)
             else:
                 df, state, meta = greedy_iteration(df, strategy, state, selection_mode=selection_mode)
             if meta.get("type") == "no_candidates":
@@ -312,6 +316,10 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
                 df, state, meta = reviewer_rule_propagate(df, strategy, state, selection_mode=selection_mode,
                                                           prop_k=prop_k, prop_delta=prop_delta,
                                                           feature_space=feature_space)
+            elif propagation_mode == "cluster_baskets":
+                from greedy import cluster_baskets_iteration
+                df, state, meta = cluster_baskets_iteration(df, strategy, state, selection_mode=selection_mode,
+                                                            basket_alpha=basket_alpha)
             else:
                 df, state, meta = greedy_iteration(df, strategy, state, selection_mode=selection_mode)
             if meta.get("type") == "no_candidates":
@@ -462,10 +470,13 @@ def run_unsupervised(compute_shap=False, early_stop=False, chunk_size=50, min_de
                   auc=auc, early_stop=early_stop_info)
     return df_cat, cat_importances, precision, recall, cat_model, initial_shap
 
-def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False, greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False, propagation_space=None, prop_weight_mode="uniform", selection_mode="uncertainty", early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2, seed=42, retrain_every=1, propagation_mode="auto_greedy", prop_k=2, prop_delta=0.25, feature_space="off"):
+def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False, greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False, propagation_space=None, prop_weight_mode="uniform", selection_mode="uncertainty", early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2, seed=42, retrain_every=1, propagation_mode="auto_greedy", prop_k=2, prop_delta=0.25, feature_space="off", basket_alpha=0.5):
     if propagation_mode == "shap_box":
         needs_shap = True
         greedy_batching = True  # Prüfer-Regel ist Einzelfall-basiert (ein Seed pro Iteration)
+    elif propagation_mode == "cluster_baskets":
+        needs_shap = True
+        greedy_batching = True
     else:
         needs_shap = any(s.startswith("shap") for s in propagation_space) if propagation_space else False
     config = dict(timestamp=datetime.now().isoformat(timespec="seconds"),
@@ -476,8 +487,8 @@ def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corre
                   prop_weight_mode=prop_weight_mode, selection_mode=selection_mode,
                   early_stop=early_stop, chunk_size=chunk_size, min_delta=min_delta,
                   stop_patience=stop_patience, seed=seed, retrain_every=retrain_every,
-                  propagation_mode=propagation_mode, prop_k=prop_k, prop_delta=prop_delta,
-                  feature_space=feature_space)
+                propagation_mode=propagation_mode, prop_k=prop_k, prop_delta=prop_delta,
+                feature_space=feature_space, basket_alpha=basket_alpha)
     run = logstore.open_run(config)
     t0 = time.time()
     try:
@@ -537,10 +548,8 @@ if __name__ == "__main__":
     #   "value_box" / "perfect_knowledge" (siehe §4 Decision 12).
     # Keine Parameter-Anpassung an Ergebnissen -> siehe PROJECT_CONTEXT §9.
 
-    # --- adaptive shap_box, feature_space=off, l=500, absolut ---
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_delta=0.25, feature_space="perfect_knowledge")
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_delta=0.25, feature_space="value_box")
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_delta=0.25, feature_space="off")
+    # --- cluster_baskets, l=500, margin, retrain_every=1 ---
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="cluster_baskets", basket_alpha=0.5)
     # --- adaptive shap_box, feature_space=value_box, l=500, absolut ---
     # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_delta=0.25, feature_space="value_box")
 
