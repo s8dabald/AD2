@@ -116,7 +116,8 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
                      prop_weight_mode="uniform", selection_mode="uncertainty",
                      early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2,
                      seed=42, run=None, retrain_every=1,
-                     propagation_mode="auto_greedy", prop_k=2, prop_delta=0.25, feature_space="off"):
+                     propagation_mode="auto_greedy", prop_k=2, prop_delta=0.25, feature_space="off",
+                     basket_alpha=0.5):
     if greedy_batching:
         state = new_state(greedy_T, propagation_space=propagation_space)
         # Bootstrap SHAP from initial model so first iteration can use SHAP spaces
@@ -282,7 +283,8 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
                          prop_weight_mode="uniform", selection_mode="uncertainty",
                          early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2,
                          seed=42, run=None, retrain_every=1,
-                         propagation_mode="auto_greedy", prop_k=2, prop_delta=0.25, feature_space="off"):
+                         propagation_mode="auto_greedy", prop_k=2, prop_delta=0.25, feature_space="off",
+                         basket_alpha=0.5):
     """Like retrain_catboost, but continues the previous model via init_model
     instead of a full 500-tree retrain (warm start)."""
     if greedy_batching:
@@ -505,7 +507,7 @@ def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corre
                 early_stop=early_stop, chunk_size=chunk_size, min_delta=min_delta,
                 stop_patience=stop_patience, seed=seed, run=run, retrain_every=retrain_every,
                 propagation_mode=propagation_mode, prop_k=prop_k, prop_delta=prop_delta,
-                feature_space=feature_space)
+                feature_space=feature_space, basket_alpha=basket_alpha)
         else:
             df, cat_importances, precision, recall, results = retrain_catboost(
                 df, l, corrected_weights, corrected_saved, strategy,
@@ -516,7 +518,7 @@ def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corre
                 early_stop=early_stop, chunk_size=chunk_size, min_delta=min_delta,
                 stop_patience=stop_patience, seed=seed, run=run, retrain_every=retrain_every,
                 propagation_mode=propagation_mode, prop_k=prop_k, prop_delta=prop_delta,
-                feature_space=feature_space)
+                feature_space=feature_space, basket_alpha=basket_alpha)
         run.close(wall_time_s=time.time() - t0, final_precision=precision, final_recall=recall)
         printed_run_id = run.run_id
         test_logger(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] | run_id= {printed_run_id} | training_strat= {training_strat}, l={l}, corrected_weights = {corrected_weights}, corrected_saved = {corrected_saved}, strategy = {strategy}, greedy_batching = {greedy_batching}, greedy_T = {greedy_T}, compute_shap = {needs_shap}, skip_retrain_on_skip = {skip_retrain_on_skip}, propagation_space = {propagation_space}, prop_weight_mode = {prop_weight_mode}, selection_mode = {selection_mode}, early_stop = {early_stop}, chunk_size = {chunk_size}, min_delta = {min_delta}, stop_patience = {stop_patience}, seed = {seed}, retrain_every = {retrain_every}, propagation_mode = {propagation_mode}, prop_k = {prop_k}, prop_delta = {prop_delta}, feature_space = {feature_space}", results)
