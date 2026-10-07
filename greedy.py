@@ -568,7 +568,14 @@ def _oracle_basket_for(pid):
 def _oracle_centroid_for(basket_id, sel_cols):
     _load_ideal()
     centroid = _IDEAL_CENTROIDS.get(basket_id) if _IDEAL_CENTROIDS else None
-    if centroid is None or max(sel_cols, default=-1) >= len(centroid):
+    if centroid is None:
+        return None
+    # The exported Oracle centroids are already in the selected SHAP space
+    # (e.g. 52 shap_raw dimensions), while sel_cols refers to full-model
+    # feature positions. Do not apply those full-space indices a second time.
+    if len(centroid) == len(sel_cols):
+        return centroid
+    if max(sel_cols, default=-1) >= len(centroid):
         return None
     return centroid[sel_cols]
 
