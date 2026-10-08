@@ -149,6 +149,10 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
                      basket_alpha=0.5):
     if greedy_batching:
         state = new_state(greedy_T, propagation_space=propagation_space)
+        if propagation_mode == "label_consistent_baskets":
+            if retrain_every < 1:
+                raise ValueError("retrain_every must be at least 1")
+            state["review_phase_size"] = retrain_every
         # Bootstrap SHAP from initial model so first iteration can use SHAP spaces
         if initial_shap is not None:
             state["shap_vals"] = initial_shap
@@ -216,12 +220,15 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
             skip_retrain = False
         query_s = time.time() - t_q
 
-        should_retrain = (
-            propagation_mode == "cluster_baskets_direct"
-            or meta.get("force_retrain", False)
-            or ((i + 1) % retrain_every == 0 and not skip_retrain
-                and _retrain_guard_ok(df, state, min_reviews=15))
-        )
+        if propagation_mode == "label_consistent_baskets":
+            should_retrain = meta.get("force_retrain", False)
+        else:
+            should_retrain = (
+                propagation_mode == "cluster_baskets_direct"
+                or meta.get("force_retrain", False)
+                or ((i + 1) % retrain_every == 0 and not skip_retrain
+                    and _retrain_guard_ok(df, state, min_reviews=15))
+            )
         if not should_retrain:
             if skip_retrain:
                 print(f"Skip-Retrain (keine Labeländerung) | "
@@ -344,6 +351,10 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
     instead of a full 500-tree retrain (warm start)."""
     if greedy_batching:
         state = new_state(greedy_T, propagation_space=propagation_space)
+        if propagation_mode == "label_consistent_baskets":
+            if retrain_every < 1:
+                raise ValueError("retrain_every must be at least 1")
+            state["review_phase_size"] = retrain_every
         # Bootstrap SHAP from initial model so first iteration can use SHAP spaces
         if initial_shap is not None:
             state["shap_vals"] = initial_shap
@@ -412,12 +423,15 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
             skip_retrain = False
         query_s = time.time() - t_q
 
-        should_retrain = (
-            propagation_mode == "cluster_baskets_direct"
-            or meta.get("force_retrain", False)
-            or ((i + 1) % retrain_every == 0 and not skip_retrain
-                and _retrain_guard_ok(df, state, min_reviews=15))
-        )
+        if propagation_mode == "label_consistent_baskets":
+            should_retrain = meta.get("force_retrain", False)
+        else:
+            should_retrain = (
+                propagation_mode == "cluster_baskets_direct"
+                or meta.get("force_retrain", False)
+                or ((i + 1) % retrain_every == 0 and not skip_retrain
+                    and _retrain_guard_ok(df, state, min_reviews=15))
+            )
         if not should_retrain:
             if skip_retrain:
                 print(f"Skip-Retrain (keine Labeländerung) | "
@@ -650,7 +664,7 @@ if __name__ == "__main__":
     # --- cluster_baskets, l=500, margin, retrain_every=15 ---
     # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=15, propagation_mode="cluster_baskets", basket_alpha=0.5)
     # Alternative: feste Oracle-Centroids statt organisch gemittelter Basket-Centroids.
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=15, propagation_mode="label_consistent_baskets", basket_alpha=0.5)
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=25, propagation_mode="label_consistent_baskets", basket_alpha=0.5)
     # Experiment: alle Oracle-Centroids sofort aktiv; Matching nur ueber aktuelle Modell-SHAPs.
     # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="cluster_baskets_direct")
     # Experiment: Reviewer-Phasen mit label-konsistenter Propagation und Konflikt-Subclustering.
