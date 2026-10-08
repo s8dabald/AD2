@@ -1,6 +1,8 @@
 import os
 import numpy as np
 import pandas as pd
+from scipy.optimize import linear_sum_assignment
+from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 from querystep import margin_uncertainty, entropy_uncertainty, novelty_uncertainty
@@ -74,7 +76,12 @@ def new_state(T=None, propagation_space=None):
     # cluster_baskets
     "pipeline_baskets": [],
     "case_to_basket": {},
+    "candidate_case_to_basket": {},
     "case_source": {},
+    "review_phase_count": 0,
+    "review_phase_size": 25,
+    "phase": "review",
+    "conflict_confirmations": [],
     "basket_counter": 0,
     "shap_scaler": None,
     "shap_std_cache": None,
@@ -594,6 +601,19 @@ def _ensure_shap_std(state, S_raw, ids):
     return S_std
 
 
+def _normalize_distance_scores(distances):
+    """Normalize finite distances while keeping unavailable distances neutral."""
+    distances = np.asarray(distances, dtype=float)
+    normalized = np.zeros_like(distances)
+    finite = np.isfinite(distances)
+    if not finite.any():
+        return normalized
+    max_distance = distances[finite].max()
+    if max_distance > 0:
+        normalized[finite] = distances[finite] / max_distance
+    return normalized
+
+
 def _get_or_create_pipeline_basket(state, ideal_bid, ideal_label, ideal_name):
     for b in state["pipeline_baskets"]:
         if b["ideal_bid"] == ideal_bid:
@@ -614,19 +634,36 @@ def _get_or_create_pipeline_basket(state, ideal_bid, ideal_label, ideal_name):
 def _update_basket_centroids(state, S_std, ids):
     if S_std is None:
         return
-    id_to_idx = {pid: i for i, pid in enumerate(ids)}
+    id_to_idx = {str(pid): i for i, pid in enumerate(ids)}
     for b in state["pipeline_baskets"]:
         if len(b["reviewed_ids"]) == 0:
             continue
-        idxs = [id_to_idx[pid] for pid in b["reviewed_ids"] if pid in id_to_idx]
+        idxs = [id_to_idx[str(pid)] for pid in b["reviewed_ids"] if str(pid) in id_to_idx]
         if idxs:
             b["centroid_std"] = S_std[idxs].mean(axis=0)
+
+
+def _ensure_basket_centroids(state, S_std, ids):
+    """Keep all active basket centroids in the current SHAP dimensionality."""
+    if S_std is None:
+        return
+    dimension = S_std.shape[1]
+    id_to_idx = {str(pid): i for i, pid in enumerate(ids)}
+    for b in state["pipeline_baskets"]:
+        centroid = b.get("centroid_std")
+        if isinstance(centroid, np.ndarray) and centroid.shape == (dimension,):
+            continue
+        idxs = [
+            id_to_idx[str(pid)] for pid in b.get("reviewed_ids", set())
+            if str(pid) in id_to_idx
+        ]
+        b["centroid_std"] = S_std[idxs].mean(axis=0) if idxs else np.zeros(dimension)
 
 
 def _assign_unreviewed(state, S_std, ids):
     if S_std is None or len(state["pipeline_baskets"]) == 0:
         return
-    id_to_idx = {pid: i for i, pid in enumerate(ids)}
+    _ensure_basket_centroids(state, S_std, ids)
     # ensure centroids exist (fallback to zero if empty)
     for b in state["pipeline_baskets"]:
         if b["centroid_std"] is None:
@@ -644,7 +681,8 @@ def _assign_unreviewed(state, S_std, ids):
         state["case_source"][str(pid)] = "propagated"
 
 
-def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty", basket_alpha=0.5):
+def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty", basket_alpha=0.5,
+                              label_consistent=False):
     meta = {}
 
     _ensure_propagation(df, state)
@@ -663,6 +701,7 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
     S_raw = state["shap_vals"][:, sel_cols]
     ids = state["X_ids"]
     S_std = _ensure_shap_std(state, S_raw, ids)
+    _ensure_basket_centroids(state, S_std, ids)
 
     df, score_col = _uncertainty_scores(df, strategy, state)
     pool_mask = ~df["posting_id"].isin(state["directly_corrected"]) if False else True  # reviewed excluded from selection? reviewed are directly_corrected
@@ -695,8 +734,7 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
     pool_idx = pool.index.values
     u = pool[score_col].values
     bf = d_to_b[pool.index.values]
-    bf_max = bf.max() if bf.size else 1.0
-    bf_n = bf / bf_max if bf_max > 0 else bf
+    bf_n = _normalize_distance_scores(bf)
     combined = basket_alpha * u + (1.0 - basket_alpha) * bf_n
     m_pos = pool.index[np.argmax(combined)]
     M = df.loc[m_pos, "posting_id"]
@@ -715,15 +753,37 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
     state["case_source"][M_str] = "reviewed"
 
     _update_basket_centroids(state, S_std, ids)
-    _assign_unreviewed(state, S_std, ids)
-
-    # propagate labels
-    prev_pred = df["pred_label"].values.copy()
     bid_to_label = {b["id"]: b["label"] for b in state["pipeline_baskets"]}
-    for i, pid in enumerate(ids):
-        bid = state["case_to_basket"].get(str(pid))
-        if bid is not None and bid in bid_to_label:
-            df.loc[df.index[i], "pred_label"] = bid_to_label[bid]
+    _assign_unreviewed(state, S_std, ids)
+    if label_consistent:
+        state["candidate_case_to_basket"] = dict(state["case_to_basket"])
+        case_labels = dict(zip(
+            df["posting_id"].astype(str),
+            df["label"].astype(int),
+        ))
+        allowed = {
+            pid: bid for pid, bid in state["case_to_basket"].items()
+            if case_labels[pid] == bid_to_label[bid]
+        }
+        for pid in list(state["case_to_basket"]):
+            if pid not in allowed and pid != M_str:
+                state["case_to_basket"].pop(pid, None)
+                state["case_source"].pop(pid, None)
+
+        # propagate labels
+        prev_pred = df["pred_label"].values.copy()
+        assigned_bids = np.asarray(
+            [state["case_to_basket"].get(str(pid), -1) for pid in ids],
+            dtype=object,
+        )
+        assigned_mask = assigned_bids != -1
+        if assigned_mask.any():
+            assigned_labels = np.asarray([
+                bid_to_label[bid] for bid in assigned_bids[assigned_mask]
+            ], dtype=df["pred_label"].dtype)
+            pred_labels = df["pred_label"].to_numpy(copy=True)
+            pred_labels[assigned_mask] = assigned_labels
+            df["pred_label"] = pred_labels
 
     changed = df["pred_label"].values != prev_pred
     state["covered"] = set(ids)  # all assigned conceptually
@@ -750,6 +810,134 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
     ]
 
     df = df.drop(columns=[score_col])
+    return df, state, meta
+
+
+def label_consistent_basket_iteration(df, strategy, state, selection_mode="uncertainty",
+                                      basket_alpha=0.5):
+    if state["phase"] == "review":
+        df, state, meta = cluster_baskets_iteration(
+            df, strategy, state, selection_mode=selection_mode,
+            basket_alpha=basket_alpha, label_consistent=True)
+        state["review_phase_count"] += 1
+        meta["phase"] = "review"
+        meta["force_retrain"] = state["review_phase_count"] >= state["review_phase_size"]
+        if meta["force_retrain"]:
+            state["phase"] = "conflict"
+        return df, state, meta
+
+    _ensure_propagation(df, state)
+    sel_cols = state["shap_raw_indices"]
+    S_std = _ensure_shap_std(state, state["shap_vals"][:, sel_cols], state["X_ids"])
+    ids = state["X_ids"]
+    _ensure_basket_centroids(state, S_std, ids)
+    prev_pred = df["pred_label"].values.copy()
+
+    if not state["conflict_confirmations"]:
+        cents = np.stack([b["centroid_std"] for b in state["pipeline_baskets"]], axis=0)
+        basket_ids = [b["id"] for b in state["pipeline_baskets"]]
+        nearest = np.argmin(
+            ((S_std[:, None, :] - cents[None, :, :]) ** 2).sum(axis=2),
+            axis=1,
+        )
+        state["candidate_case_to_basket"] = {
+            str(pid): basket_ids[int(nearest[i])] for i, pid in enumerate(ids)
+        }
+        reviewed = {str(pid) for pid in state["directly_corrected"]}
+        for b in state["pipeline_baskets"]:
+            conflict = [
+                i for i, pid in enumerate(ids)
+                if state["candidate_case_to_basket"].get(str(pid)) == b["id"]
+                and str(pid) not in reviewed
+                and int(df.iloc[i]["label"]) != b["label"]
+            ]
+            if not conflict:
+                continue
+            if len(conflict) == 1:
+                chosen = conflict
+            else:
+                km = KMeans(n_clusters=2, n_init=10, random_state=42)
+                sub_labels = km.fit_predict(S_std[conflict])
+                sub_centers = km.cluster_centers_
+                target = int(np.argmin(np.linalg.norm(
+                    sub_centers - b["centroid_std"], axis=1)))
+                chosen = [idx for idx, sub in zip(conflict, sub_labels) if sub == target]
+            representative = min(
+                chosen,
+                key=lambda idx: float(np.linalg.norm(S_std[idx] - b["centroid_std"])),
+            )
+            state["conflict_confirmations"].append({
+                "basket_id": b["id"],
+                "case_ids": [str(ids[idx]) for idx in chosen],
+                "representative": str(ids[representative]),
+            })
+
+    confirmation = state["conflict_confirmations"].pop(0) if state["conflict_confirmations"] else None
+    if confirmation is not None:
+        representative = confirmation["representative"]
+        target_bid = confirmation["basket_id"]
+        target_idx = int(np.where(ids.astype(str) == representative)[0][0])
+        oracle_bid, oracle_label, oracle_name = _oracle_basket_for(representative)
+        if oracle_bid is None:
+            oracle_bid, oracle_label, oracle_name = target_bid, int(df.iloc[target_idx]["label"]), ""
+        reviewed_basket = _get_or_create_pipeline_basket(
+            state, oracle_bid, oracle_label, oracle_name)
+        reviewed_basket["reviewed_ids"].add(representative)
+        state["directly_corrected"].add(ids[target_idx])
+        state["case_to_basket"][representative] = reviewed_basket["id"]
+        state["case_source"][representative] = "reviewed"
+        df.loc[df.index[target_idx], "pred_label"] = reviewed_basket["label"]
+
+        confirmed = oracle_bid == target_bid
+        if confirmed:
+            target_indices = [
+                int(np.where(ids.astype(str) == pid)[0][0])
+                for pid in confirmation["case_ids"]
+            ]
+            for idx in target_indices:
+                pid = str(ids[idx])
+                state["case_to_basket"][pid] = target_bid
+                state["case_source"][pid] = "reviewed" if pid == representative else "propagated"
+                df.loc[df.index[idx], "pred_label"] = next(
+                    b["label"] for b in state["pipeline_baskets"] if b["id"] == target_bid)
+
+        if state["conflict_confirmations"]:
+            state["phase"] = "conflict"
+        else:
+            state["phase"] = "review"
+            state["review_phase_count"] = 0
+        state["covered"] = set(state["case_to_basket"])
+        meta = {
+            "type": "conflict_confirmed" if confirmed else "conflict_rejected",
+            "phase": "conflict",
+            "force_retrain": not state["conflict_confirmations"],
+            "representative": representative,
+            "target_basket": target_bid,
+            "confirmed": confirmed,
+            "n_baskets": len(state["pipeline_baskets"]),
+            "n_reviewed": len(state["directly_corrected"]),
+            "n_flipped": int((df["pred_label"].values != prev_pred).sum()),
+            "baskets": [],
+        }
+    else:
+        state["phase"] = "review"
+        state["review_phase_count"] = 0
+        meta = {
+            "type": "conflict_subclusters",
+            "phase": "conflict",
+            "force_retrain": True,
+            "n_baskets": len(state["pipeline_baskets"]),
+            "n_reviewed": len(state["directly_corrected"]),
+            "n_flipped": 0,
+            "baskets": [],
+        }
+    for b in state["pipeline_baskets"]:
+        total = sum(1 for bid in state["case_to_basket"].values() if bid == b["id"])
+        meta["baskets"].append({
+            "id": b["id"], "oracle_id": b["ideal_bid"], "name": b["name"],
+            "label": b["label"], "total": total,
+            "reviewed": len(b["reviewed_ids"]), "propagated": total - len(b["reviewed_ids"]),
+        })
     return df, state, meta
 
 
@@ -790,10 +978,8 @@ def cluster_baskets_oracle_iteration(df, strategy, state, selection_mode="uncert
     pool_idx = pool.index.values
     uncertainty = pool[score_col].values
     dist = assigned_dist[pool_idx]
-    dist_max = dist.max() if dist.size else 1.0
-    combined = basket_alpha * uncertainty + (1.0 - basket_alpha) * (
-        dist / dist_max if dist_max > 0 else dist
-    )
+    dist_n = _normalize_distance_scores(dist)
+    combined = basket_alpha * uncertainty + (1.0 - basket_alpha) * dist_n
     m_pos = pool.index[np.argmax(combined)]
     M = df.loc[m_pos, "posting_id"]
     ideal_bid, ideal_label, ideal_name = _oracle_basket_for(M)
@@ -846,4 +1032,97 @@ def cluster_baskets_oracle_iteration(df, strategy, state, selection_mode="uncert
             ),
         })
     df = df.drop(columns=[score_col])
+    return df, state, meta
+
+
+def cluster_baskets_direct_iteration(df, state):
+    """Recluster current SHAPs like the ideal-basket probe and map clusters."""
+    _ensure_propagation(df, state)
+    ps = state["propagation_space"]
+    if "shap_raw" in ps and state["shap_raw_indices"] is not None:
+        sel_cols = state["shap_raw_indices"]
+    elif "shap_all" in ps and state["shap_vals"] is not None:
+        sel_cols = list(range(state["shap_vals"].shape[1]))
+    elif "shap_flags" in ps and state["shap_flag_indices"] is not None:
+        sel_cols = state["shap_flag_indices"]
+    else:
+        raise ValueError("cluster_baskets_direct requires shap propagation_space")
+    if state["shap_vals"] is None:
+        raise ValueError("cluster_baskets_direct needs shap_vals")
+
+    S_raw = state["shap_vals"][:, sel_cols]
+    # Match shap_cluster_probe.py: fit the scaler on the current SHAP matrix
+    # for every clustering pass, then cluster the scaled embedding.
+    S_std = StandardScaler().fit_transform(S_raw)
+    _load_ideal()
+    if not _IDEAL_CENTROIDS:
+        raise ValueError("cluster_baskets_direct needs Oracle centroids")
+
+    n_clusters = len(_IDEAL_CENTROIDS)
+    if len(S_std) < n_clusters:
+        raise ValueError(
+            f"cluster_baskets_direct needs at least {n_clusters} cases, got {len(S_std)}"
+        )
+    km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
+    cluster_ids = km.fit_predict(S_std)
+    oracle_ids = sorted(_IDEAL_CENTROIDS)
+    oracle_centroids = np.stack([
+        _oracle_centroid_for(bid, sel_cols) for bid in oracle_ids
+    ])
+    if oracle_centroids.shape[1] != km.cluster_centers_.shape[1]:
+        raise ValueError("cluster_baskets_direct has incompatible centroid dimensions")
+
+    distances = (
+        (km.cluster_centers_[:, None, :] - oracle_centroids[None, :, :]) ** 2
+    ).sum(axis=2)
+    cluster_rows, oracle_cols = linear_sum_assignment(distances)
+    cluster_to_oracle = {
+        int(cluster_id): oracle_ids[int(oracle_col)]
+        for cluster_id, oracle_col in zip(cluster_rows, oracle_cols)
+    }
+
+    state["pipeline_baskets"] = []
+    state["case_to_basket"] = {}
+    state["case_source"] = {}
+    for bid in oracle_ids:
+        centroid = _oracle_centroid_for(bid, sel_cols)
+        name, label = _IDEAL_NAMES.get(bid, ("", 0))
+        state["pipeline_baskets"].append({
+            "id": bid,
+            "ideal_bid": bid,
+            "label": label,
+            "name": name,
+            "centroid_std": centroid,
+            "reviewed_ids": set(),
+        })
+    ids = state["X_ids"]
+    prev_pred = df["pred_label"].values.copy()
+    bid_to_label = {b["id"]: b["label"] for b in state["pipeline_baskets"]}
+    for i, pid in enumerate(ids):
+        bid = cluster_to_oracle[int(cluster_ids[i])]
+        state["case_to_basket"][str(pid)] = bid
+        state["case_source"][str(pid)] = "propagated"
+        df.loc[df.index[i], "pred_label"] = bid_to_label[bid]
+    state["covered"] = set(ids)
+
+    changed = df["pred_label"].values != prev_pred
+    meta = {
+        "type": "direct_rematch",
+        "n_baskets": len(state["pipeline_baskets"]),
+        "n_reviewed": 0,
+        "n_propagated": len(ids),
+        "n_flipped": int(changed.sum()),
+        "baskets": [],
+    }
+    for b in state["pipeline_baskets"]:
+        total = sum(1 for bid in state["case_to_basket"].values() if bid == b["id"])
+        meta["baskets"].append({
+            "id": b["id"],
+            "oracle_id": b["ideal_bid"],
+            "name": b["name"],
+            "label": b["label"],
+            "total": total,
+            "reviewed": 0,
+            "propagated": total,
+        })
     return df, state, meta

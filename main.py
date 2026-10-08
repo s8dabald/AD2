@@ -186,12 +186,20 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
                 df, state, meta = cluster_baskets_oracle_iteration(
                     df, strategy, state, selection_mode=selection_mode,
                     basket_alpha=basket_alpha)
+            elif propagation_mode == "cluster_baskets_direct":
+                from greedy import cluster_baskets_direct_iteration
+                df, state, meta = cluster_baskets_direct_iteration(df, state)
+            elif propagation_mode == "label_consistent_baskets":
+                from greedy import label_consistent_basket_iteration
+                df, state, meta = label_consistent_basket_iteration(
+                    df, strategy, state, selection_mode=selection_mode,
+                    basket_alpha=basket_alpha)
             else:
                 df, state, meta = greedy_iteration(df, strategy, state, selection_mode=selection_mode)
             if meta.get("type") == "no_candidates":
                 print("No more candidates in pool.")
                 break
-            if propagation_mode in ("cluster_baskets", "cluster_baskets_oracle"):
+            if propagation_mode in ("cluster_baskets", "cluster_baskets_oracle", "cluster_baskets_direct", "label_consistent_baskets"):
                 _print_basket_summary(i + 1, meta)
             corrected_ids = list(state["directly_corrected"] | state["covered"])
             skip_retrain = skip_retrain_on_skip and meta.get("type") == "skip"
@@ -208,7 +216,12 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
             skip_retrain = False
         query_s = time.time() - t_q
 
-        should_retrain = ((i + 1) % retrain_every == 0) and not skip_retrain and _retrain_guard_ok(df, state, min_reviews=15)
+        should_retrain = (
+            propagation_mode == "cluster_baskets_direct"
+            or meta.get("force_retrain", False)
+            or ((i + 1) % retrain_every == 0 and not skip_retrain
+                and _retrain_guard_ok(df, state, min_reviews=15))
+        )
         if not should_retrain:
             if skip_retrain:
                 print(f"Skip-Retrain (keine Labeländerung) | "
@@ -369,12 +382,20 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
                 df, state, meta = cluster_baskets_oracle_iteration(
                     df, strategy, state, selection_mode=selection_mode,
                     basket_alpha=basket_alpha)
+            elif propagation_mode == "cluster_baskets_direct":
+                from greedy import cluster_baskets_direct_iteration
+                df, state, meta = cluster_baskets_direct_iteration(df, state)
+            elif propagation_mode == "label_consistent_baskets":
+                from greedy import label_consistent_basket_iteration
+                df, state, meta = label_consistent_basket_iteration(
+                    df, strategy, state, selection_mode=selection_mode,
+                    basket_alpha=basket_alpha)
             else:
                 df, state, meta = greedy_iteration(df, strategy, state, selection_mode=selection_mode)
             if meta.get("type") == "no_candidates":
                 print("No more candidates in pool.")
                 break
-            if propagation_mode in ("cluster_baskets", "cluster_baskets_oracle"):
+            if propagation_mode in ("cluster_baskets", "cluster_baskets_oracle", "cluster_baskets_direct", "label_consistent_baskets"):
                 _print_basket_summary(i + 1, meta)
             corrected_ids = list(state["directly_corrected"] | state["covered"])
             skip_retrain = skip_retrain_on_skip and meta.get("type") == "skip"
@@ -391,7 +412,12 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
             skip_retrain = False
         query_s = time.time() - t_q
 
-        should_retrain = ((i + 1) % retrain_every == 0) and not skip_retrain and _retrain_guard_ok(df, state, min_reviews=15)
+        should_retrain = (
+            propagation_mode == "cluster_baskets_direct"
+            or meta.get("force_retrain", False)
+            or ((i + 1) % retrain_every == 0 and not skip_retrain
+                and _retrain_guard_ok(df, state, min_reviews=15))
+        )
         if not should_retrain:
             if skip_retrain:
                 print(f"Skip-Retrain (keine Labeländerung) | "
@@ -547,7 +573,7 @@ def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corre
     if propagation_mode == "shap_box":
         needs_shap = True
         greedy_batching = True  # Prüfer-Regel ist Einzelfall-basiert (ein Seed pro Iteration)
-    elif propagation_mode in ("cluster_baskets", "cluster_baskets_oracle"):
+    elif propagation_mode in ("cluster_baskets", "cluster_baskets_oracle", "cluster_baskets_direct", "label_consistent_baskets"):
         needs_shap = True
         greedy_batching = True
     else:
@@ -624,7 +650,11 @@ if __name__ == "__main__":
     # --- cluster_baskets, l=500, margin, retrain_every=15 ---
     # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=15, propagation_mode="cluster_baskets", basket_alpha=0.5)
     # Alternative: feste Oracle-Centroids statt organisch gemittelter Basket-Centroids.
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=15, propagation_mode="cluster_baskets_oracle", basket_alpha=0.5)
+    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=15, propagation_mode="label_consistent_baskets", basket_alpha=0.5)
+    # Experiment: alle Oracle-Centroids sofort aktiv; Matching nur ueber aktuelle Modell-SHAPs.
+    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="cluster_baskets_direct")
+    # Experiment: Reviewer-Phasen mit label-konsistenter Propagation und Konflikt-Subclustering.
+    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="label_consistent_baskets")
     # --- adaptive shap_box, feature_space=value_box, l=500, absolut ---
     # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_delta=0.25, feature_space="value_box")
 
