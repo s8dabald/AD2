@@ -543,6 +543,24 @@ def _load_ideal():
     if os.path.exists(names_path):
         try:
             dfn = pd.read_csv(names_path)
+            if "basket_id" not in dfn.columns or "basket_name" not in dfn.columns:
+                raise ValueError(
+                    f"{names_path} must contain basket_id and basket_name columns"
+                )
+            if dfn["basket_id"].duplicated().any():
+                duplicates = sorted(dfn.loc[dfn["basket_id"].duplicated(), "basket_id"].unique())
+                raise ValueError(f"{names_path} contains duplicate basket IDs: {duplicates}")
+            missing_names = sorted(
+                dfn.loc[
+                    dfn["basket_name"].isna()
+                    | dfn["basket_name"].astype(str).str.strip().eq(""),
+                    "basket_id",
+                ].astype(int).tolist()
+            )
+            if missing_names:
+                raise ValueError(
+                    f"{names_path} contains missing basket names for IDs: {missing_names}"
+                )
             _IDEAL_NAMES = {int(r["basket_id"]): (str(r.get("basket_name", "")) if pd.notna(r.get("basket_name", "")) else "",
                                                   int(r["label"]) if "label" in r else 0)
                             for _, r in dfn.iterrows()}
@@ -551,6 +569,8 @@ def _load_ideal():
                 int(r["basket_id"]): np.asarray(r[shap_cols].values, dtype=float)
                 for _, r in dfn.iterrows()
             }
+        except ValueError:
+            raise
         except Exception:
             _IDEAL_NAMES = {}
             _IDEAL_CENTROIDS = {}
@@ -570,6 +590,19 @@ def _oracle_basket_for(pid):
     if n and bid in n:
         name = n[bid][0] or ""
     return bid, lbl, name
+
+
+def _reviewer_basket_for(pid, fallback_bid, fallback_label, fallback_name=""):
+    """Return the simulated reviewer's selected basket for a case.
+
+    The current offline experiment uses the Oracle mapping as its deterministic
+    reviewer decision. Keeping that lookup behind this helper makes the
+    selected basket explicit and leaves one seam for a future UI/API decision.
+    """
+    selected_bid, selected_label, selected_name = _oracle_basket_for(pid)
+    if selected_bid is None:
+        return fallback_bid, fallback_label, fallback_name
+    return selected_bid, selected_label, selected_name
 
 
 def _oracle_centroid_for(basket_id, sel_cols):
@@ -875,31 +908,37 @@ def label_consistent_basket_iteration(df, strategy, state, selection_mode="uncer
     confirmation = state["conflict_confirmations"].pop(0) if state["conflict_confirmations"] else None
     if confirmation is not None:
         representative = confirmation["representative"]
-        target_bid = confirmation["basket_id"]
+        proposed_bid = confirmation["basket_id"]
         target_idx = int(np.where(ids.astype(str) == representative)[0][0])
-        oracle_bid, oracle_label, oracle_name = _oracle_basket_for(representative)
-        if oracle_bid is None:
-            oracle_bid, oracle_label, oracle_name = target_bid, int(df.iloc[target_idx]["label"]), ""
+        proposed_basket = next(
+            b for b in state["pipeline_baskets"] if b["id"] == proposed_bid
+        )
+        selected_bid, selected_label, selected_name = _reviewer_basket_for(
+            representative,
+            fallback_bid=proposed_bid,
+            fallback_label=proposed_basket["label"],
+            fallback_name=proposed_basket["name"],
+        )
         reviewed_basket = _get_or_create_pipeline_basket(
-            state, oracle_bid, oracle_label, oracle_name)
+            state, selected_bid, selected_label, selected_name)
         reviewed_basket["reviewed_ids"].add(representative)
         state["directly_corrected"].add(ids[target_idx])
         state["case_to_basket"][representative] = reviewed_basket["id"]
         state["case_source"][representative] = "reviewed"
         df.loc[df.index[target_idx], "pred_label"] = reviewed_basket["label"]
 
-        confirmed = oracle_bid == target_bid
-        if confirmed:
+        propagation_applied = selected_bid == proposed_bid
+        if propagation_applied:
             target_indices = [
                 int(np.where(ids.astype(str) == pid)[0][0])
                 for pid in confirmation["case_ids"]
             ]
             for idx in target_indices:
                 pid = str(ids[idx])
-                state["case_to_basket"][pid] = target_bid
+                state["case_to_basket"][pid] = proposed_bid
                 state["case_source"][pid] = "reviewed" if pid == representative else "propagated"
                 df.loc[df.index[idx], "pred_label"] = next(
-                    b["label"] for b in state["pipeline_baskets"] if b["id"] == target_bid)
+                    b["label"] for b in state["pipeline_baskets"] if b["id"] == proposed_bid)
 
         if state["conflict_confirmations"]:
             state["phase"] = "conflict"
@@ -908,12 +947,15 @@ def label_consistent_basket_iteration(df, strategy, state, selection_mode="uncer
             state["review_phase_count"] = 0
         state["covered"] = set(state["case_to_basket"])
         meta = {
-            "type": "conflict_confirmed" if confirmed else "conflict_rejected",
+            "type": "conflict_confirmed" if propagation_applied else "conflict_rejected",
             "phase": "conflict",
             "force_retrain": not state["conflict_confirmations"],
             "representative": representative,
-            "target_basket": target_bid,
-            "confirmed": confirmed,
+            "proposed_basket": proposed_bid,
+            "selected_basket": selected_bid,
+            "target_basket": proposed_bid,
+            "confirmed": propagation_applied,
+            "propagation_applied": propagation_applied,
             "n_baskets": len(state["pipeline_baskets"]),
             "n_reviewed": len(state["directly_corrected"]),
             "n_flipped": int((df["pred_label"].values != prev_pred).sum()),
