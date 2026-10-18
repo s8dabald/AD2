@@ -26,7 +26,7 @@ def _get_feature_groups(df):
     return {"features_all": all_features, "features_raw": raw, "features_flags": flags}
 
 
-def new_state(T=None, propagation_space=None):
+def new_state(T=None, propagation_space=None, seed=42):
     """State for the greedy loop, including propagation caches.
 
     Caches:
@@ -54,6 +54,7 @@ def new_state(T=None, propagation_space=None):
         "covered": set(),
         "region_of": {},
         "T": T,
+        "seed": seed,
         "X_ids": None,
         "dist_cache": {},
         "nearest": None,
@@ -243,7 +244,7 @@ def greedy_iteration(df, strategy, state, selection_mode="uncertainty"):
 
     _ensure_propagation(df, state)
     if state["T"] is None:
-        state["T"] = estimate_threshold(state)
+        state["T"] = estimate_threshold(state, random_state=state.get("seed", 42))
 
     df, score_col = _uncertainty_scores(df, strategy, state)
     pool_mask = ~df["posting_id"].isin(state["directly_corrected"])
@@ -377,7 +378,7 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
 
     if selection_mode == "uncertainty_density":
         if state["T"] is None:
-            state["T"] = estimate_threshold(state)
+            state["T"] = estimate_threshold(state, random_state=state.get("seed", 42))
         if state["neighbor_density"] is None:
             _compute_neighbor_density(state)
         pool_idx = pool.index.values
@@ -715,7 +716,7 @@ def _assign_unreviewed(state, S_std, ids):
 
 
 def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty", basket_alpha=0.5,
-                              label_consistent=False):
+                              label_consistent=False, decision_provider=None):
     meta = {}
 
     _ensure_propagation(df, state)
@@ -778,6 +779,26 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
     if ideal_bid is None:
         ideal_bid, ideal_label, ideal_name = 0, int(df.loc[m_pos, "label"]), ""
 
+    if decision_provider is not None:
+        selected = decision_provider({
+            "posting_id": M_str,
+            "proposed_basket": ideal_bid,
+            "proposed_label": ideal_label,
+            "proposed_name": ideal_name,
+            "kind": "review",
+        })
+        if selected is None:
+            df = df.drop(columns=[score_col])
+            return df, state, {
+                "type": "review_required",
+                "phase": "review",
+                "posting_id": M_str,
+                "proposed_basket": ideal_bid,
+                "proposed_label": ideal_label,
+                "proposed_name": ideal_name,
+            }
+        ideal_bid, ideal_label, ideal_name = selected
+
     pb = _get_or_create_pipeline_basket(state, ideal_bid, ideal_label, ideal_name)
     # mark reviewed
     pb["reviewed_ids"].add(M_str)
@@ -788,6 +809,7 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
     _update_basket_centroids(state, S_std, ids)
     bid_to_label = {b["id"]: b["label"] for b in state["pipeline_baskets"]}
     _assign_unreviewed(state, S_std, ids)
+    prev_pred = df["pred_label"].values.copy()
     if label_consistent:
         state["candidate_case_to_basket"] = dict(state["case_to_basket"])
         case_labels = dict(zip(
@@ -803,20 +825,19 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
                 state["case_to_basket"].pop(pid, None)
                 state["case_source"].pop(pid, None)
 
-        # propagate labels
-        prev_pred = df["pred_label"].values.copy()
-        assigned_bids = np.asarray(
-            [state["case_to_basket"].get(str(pid), -1) for pid in ids],
-            dtype=object,
-        )
-        assigned_mask = assigned_bids != -1
-        if assigned_mask.any():
-            assigned_labels = np.asarray([
-                bid_to_label[bid] for bid in assigned_bids[assigned_mask]
-            ], dtype=df["pred_label"].dtype)
-            pred_labels = df["pred_label"].to_numpy(copy=True)
-            pred_labels[assigned_mask] = assigned_labels
-            df["pred_label"] = pred_labels
+    # propagate labels
+    assigned_bids = np.asarray(
+        [state["case_to_basket"].get(str(pid), -1) for pid in ids],
+        dtype=object,
+    )
+    assigned_mask = assigned_bids != -1
+    if assigned_mask.any():
+        assigned_labels = np.asarray([
+            bid_to_label[bid] for bid in assigned_bids[assigned_mask]
+        ], dtype=df["pred_label"].dtype)
+        pred_labels = df["pred_label"].to_numpy(copy=True)
+        pred_labels[assigned_mask] = assigned_labels
+        df["pred_label"] = pred_labels
 
     changed = df["pred_label"].values != prev_pred
     state["covered"] = set(ids)  # all assigned conceptually
@@ -847,11 +868,16 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
 
 
 def label_consistent_basket_iteration(df, strategy, state, selection_mode="uncertainty",
-                                      basket_alpha=0.5):
+                                      basket_alpha=0.5, decision_provider=None):
     if state["phase"] == "review":
         df, state, meta = cluster_baskets_iteration(
             df, strategy, state, selection_mode=selection_mode,
-            basket_alpha=basket_alpha, label_consistent=True)
+            basket_alpha=basket_alpha, label_consistent=True,
+            decision_provider=decision_provider)
+        if meta.get("type") == "review_required":
+            meta["phase"] = "review"
+            meta["force_retrain"] = False
+            return df, state, meta
         state["review_phase_count"] += 1
         meta["phase"] = "review"
         meta["force_retrain"] = state["review_phase_count"] >= state["review_phase_size"]
@@ -889,7 +915,7 @@ def label_consistent_basket_iteration(df, strategy, state, selection_mode="uncer
             if len(conflict) == 1:
                 chosen = conflict
             else:
-                km = KMeans(n_clusters=2, n_init=10, random_state=42)
+                km = KMeans(n_clusters=2, n_init=10, random_state=state.get("seed", 42))
                 sub_labels = km.fit_predict(S_std[conflict])
                 sub_centers = km.cluster_centers_
                 target = int(np.argmin(np.linalg.norm(
@@ -905,20 +931,46 @@ def label_consistent_basket_iteration(df, strategy, state, selection_mode="uncer
                 "representative": str(ids[representative]),
             })
 
-    confirmation = state["conflict_confirmations"].pop(0) if state["conflict_confirmations"] else None
+    confirmation = state["conflict_confirmations"][0] if state["conflict_confirmations"] else None
     if confirmation is not None:
         representative = confirmation["representative"]
         proposed_bid = confirmation["basket_id"]
-        target_idx = int(np.where(ids.astype(str) == representative)[0][0])
         proposed_basket = next(
             b for b in state["pipeline_baskets"] if b["id"] == proposed_bid
         )
-        selected_bid, selected_label, selected_name = _reviewer_basket_for(
-            representative,
-            fallback_bid=proposed_bid,
-            fallback_label=proposed_basket["label"],
-            fallback_name=proposed_basket["name"],
-        )
+        if decision_provider is not None:
+            selected = decision_provider({
+                "posting_id": representative,
+                "proposed_basket": proposed_bid,
+                "proposed_label": proposed_basket["label"],
+                "proposed_name": proposed_basket["name"],
+                "cluster_size": len(confirmation["case_ids"]),
+                "case_ids": confirmation["case_ids"],
+                "kind": "propagation",
+            })
+            if selected is None:
+                return df, state, {
+                    "type": "review_required",
+                    "phase": "conflict",
+                    "posting_id": representative,
+                    "proposed_basket": proposed_bid,
+                    "proposed_label": proposed_basket["label"],
+                    "proposed_name": proposed_basket["name"],
+                    "cluster_size": len(confirmation["case_ids"]),
+                    "case_ids": confirmation["case_ids"],
+                }
+            selected_bid, selected_label, selected_name = selected
+            state["conflict_confirmations"].pop(0)
+        else:
+            state["conflict_confirmations"].pop(0)
+        target_idx = int(np.where(ids.astype(str) == representative)[0][0])
+        if decision_provider is None:
+            selected_bid, selected_label, selected_name = _reviewer_basket_for(
+                representative,
+                fallback_bid=proposed_bid,
+                fallback_label=proposed_basket["label"],
+                fallback_name=proposed_basket["name"],
+            )
         reviewed_basket = _get_or_create_pipeline_basket(
             state, selected_bid, selected_label, selected_name)
         reviewed_basket["reviewed_ids"].add(representative)
@@ -1105,7 +1157,7 @@ def cluster_baskets_direct_iteration(df, state):
         raise ValueError(
             f"cluster_baskets_direct needs at least {n_clusters} cases, got {len(S_std)}"
         )
-    km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
+    km = KMeans(n_clusters=n_clusters, n_init=10, random_state=state.get("seed", 42))
     cluster_ids = km.fit_predict(S_std)
     oracle_ids = sorted(_IDEAL_CENTROIDS)
     oracle_centroids = np.stack([

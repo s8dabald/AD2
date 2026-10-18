@@ -148,7 +148,7 @@ def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, stra
                      propagation_mode="auto_greedy", prop_k=2, prop_delta=0.25, feature_space="off",
                      basket_alpha=0.5):
     if greedy_batching:
-        state = new_state(greedy_T, propagation_space=propagation_space)
+        state = new_state(greedy_T, propagation_space=propagation_space, seed=seed)
         if propagation_mode == "label_consistent_baskets":
             if retrain_every < 1:
                 raise ValueError("retrain_every must be at least 1")
@@ -350,7 +350,7 @@ def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, 
     """Like retrain_catboost, but continues the previous model via init_model
     instead of a full 500-tree retrain (warm start)."""
     if greedy_batching:
-        state = new_state(greedy_T, propagation_space=propagation_space)
+        state = new_state(greedy_T, propagation_space=propagation_space, seed=seed)
         if propagation_mode == "label_consistent_baskets":
             if retrain_every < 1:
                 raise ValueError("retrain_every must be at least 1")
@@ -567,7 +567,7 @@ def replace_posting(df, posting_id, replacement):
 
 def run_unsupervised(compute_shap=False, early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2, seed=42, run=None):
     df, labels = full_dataprep()
-    df_if = run_if(df, labels, verbose=False)
+    df_if = run_if(df, labels, verbose=False, seed=seed)
     df_cat, cat_importances, precision, recall, cat_model, tn, fp, fn, tp, initial_shap, early_stop_info = train_catboost(
         df_if, verbose=True, compute_shap=compute_shap,
         early_stop=early_stop, chunk_size=chunk_size, min_delta=min_delta,
@@ -640,7 +640,7 @@ def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corre
 
 if __name__ == "__main__":
 
-    
+    seeds = [42, 50, 100, 136, 389]
     #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="uniform", selection_mode="uncertainty")
     
     #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="linear_decay", selection_mode="uncertainty")
@@ -664,7 +664,8 @@ if __name__ == "__main__":
     # --- cluster_baskets, l=500, margin, retrain_every=15 ---
     # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=15, propagation_mode="cluster_baskets", basket_alpha=0.5)
     # Alternative: feste Oracle-Centroids statt organisch gemittelter Basket-Centroids.
-    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=25, propagation_mode="label_consistent_baskets", basket_alpha=0.5)
+    for se in seeds:
+        df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=200, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=25, propagation_mode="label_consistent_baskets", basket_alpha=0.5, seed=se)
     # Experiment: alle Oracle-Centroids sofort aktiv; Matching nur ueber aktuelle Modell-SHAPs.
     # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="cluster_baskets_direct")
     # Experiment: Reviewer-Phasen mit label-konsistenter Propagation und Konflikt-Subclustering.

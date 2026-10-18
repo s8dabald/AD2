@@ -2,14 +2,14 @@ from sklearn.ensemble import IsolationForest
 import numpy as np
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, classification_report
 #load final feature matrix
-def run_if(df, labels, verbose=False):
+def run_if(df, labels, verbose=False, seed=42):
     X_final = df.drop(columns= 'posting_id')
 
     #setup isolation forest model
     if_model = IsolationForest(
             n_estimators=1000,
             max_samples=400,
-            random_state=42,
+            random_state=seed,
             n_jobs=-1,
 
         )
