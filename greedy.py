@@ -327,6 +327,111 @@ def greedy_iteration(df, strategy, state, selection_mode="uncertainty"):
     return df, state, meta
 
 
+def _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta):
+    """Shared seed selection + adaptive SHAP decision-space box (candidate family).
+
+    Used by shap_box (reviewer_rule_propagate) and reviewer_box. Returns (df, info);
+    info is None when the review pool is empty (no candidates). Does NOT apply any
+    feature-space (value) filter.
+    """
+    _ensure_propagation(df, state)
+    ps = state["propagation_space"]
+    if "shap_raw" in ps and state["shap_raw_indices"] is not None:
+        sel_cols = state["shap_raw_indices"]
+    elif "shap_all" in ps and state["shap_vals"] is not None:
+        sel_cols = list(range(state["shap_vals"].shape[1]))
+    elif "shap_flags" in ps and state["shap_flag_indices"] is not None:
+        sel_cols = state["shap_flag_indices"]
+    else:
+        raise ValueError("shap_box propagation_mode requires a shap propagation_space (z.B. ['shap_raw'])")
+    if state["shap_vals"] is None:
+        raise ValueError("shap_box needs shap_vals (compute_shap=True / initial_shap via run_unsupervised)")
+    S = state["shap_vals"]
+
+    df, score_col = _uncertainty_scores(df, strategy, state)
+    pool_mask = ~df["posting_id"].isin(state["directly_corrected"])
+    pool = df[pool_mask]
+    if pool.empty:
+        df = df.drop(columns=[score_col])
+        return df, None
+
+    if selection_mode == "uncertainty_density":
+        if state["T"] is None:
+            state["T"] = estimate_threshold(state, random_state=state.get("seed", 42))
+        if state["neighbor_density"] is None:
+            _compute_neighbor_density(state)
+        pool_idx = pool.index.values
+        uncertainty = pool[score_col].values
+        density = state["neighbor_density"][pool_idx]
+        density_max = density.max()
+        density_norm = density / density_max if density_max > 0 else density
+        combined = uncertainty * density_norm
+        m_pos = pool.index[np.argmax(combined)]
+    else:
+        m_pos = pool[score_col].idxmax()
+    M = df.loc[m_pos, "posting_id"]
+    M_label = int(df.loc[m_pos, "label"])
+    M_pred_score = float(df.loc[m_pos, "pred_score"])
+    M_pred_label = int(df.loc[m_pos, "pred_label"])
+    df = df.drop(columns=[score_col])
+
+    # ---- Decision Space: adaptive entscheidende SHAP-Features (echte Werte).
+    # Baseline = Logit - Summe der SHAP-Beitraege im Zielfeatures-Raum; daraus
+    # kumulieren (vorzeichenbehaftet) und das LETZTE Ueberqueren der Logit-0
+    # bestimmen. Danach kann der echte Rest das Vorzeichen nicht mehr kippen.
+    M_idx = np.where(state["X_ids"] == M)[0][0]
+    row = S[M_idx, sel_cols]
+    p = min(max(M_pred_score, 1e-7), 1.0 - 1e-7)
+    logit = float(np.log(p / (1.0 - p)))
+    base = logit - float(row.sum())
+    order = np.argsort(-np.abs(row))
+    cum = base + np.cumsum(row[order])
+    tol = 1e-9 * max(1.0, abs(logit))
+    side = np.where(cum >= tol, 1, -1)
+    final = side[-1] if len(side) else 0
+    dev = np.where(side != final)[0]
+    if len(dev):
+        k = int(dev[-1]) + 2  # Prefix bis einschliesslich des Features, das die Endseite fixiert
+    else:
+        k = 0  # Entscheidung steht schon bei der Baseline: keine Familie
+    k = int(min(k, len(sel_cols)))
+    d = min(prop_delta, 0.99)
+
+    mask = np.zeros(len(df), dtype=bool)
+    family_size = 1
+    col_idx = []
+    bands = []
+    if k >= 1:
+        topk = order[:k]
+        col_idx = [sel_cols[t] for t in topk]
+        bands = []
+        for j in col_idx:
+            v = float(S[M_idx, j])
+            if v == 0.0:
+                lo, hi = -1e-9, 1e-9
+            else:
+                lo, hi = sorted((v * (1.0 - d), v * (1.0 + d)))
+            bands.append((lo, hi))
+
+        mask = np.ones(len(df), dtype=bool)
+        for j, (lo, hi) in zip(col_idx, bands):
+            col = S[:, j]
+            mask &= (col >= lo) & (col <= hi)
+        if not mask.any():
+            mask[M_idx] = True  # Fallback: mindestens der Seed selbst
+        family_size = int(mask.sum())
+    else:
+        # k==0: Entscheidung steht bereits an der Baseline -> keine Familie, nur Seed
+        mask[M_idx] = True
+
+    return df, {
+        "S": S, "sel_cols": sel_cols, "mask": mask, "family_size": family_size,
+        "col_idx": col_idx, "bands": bands, "k": k, "M": M, "M_label": M_label,
+        "M_pred_score": M_pred_score, "M_pred_label": M_pred_label,
+        "M_idx": M_idx, "m_pos": m_pos,
+    }
+
+
 def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
                             prop_k=2, prop_delta=0.25, feature_space="off"):
     """Prüfer-Regel-Propagation (shap_box, adaptive Feature-Selektion): Statt
@@ -354,95 +459,28 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
     """
     meta = {}
 
-    _ensure_propagation(df, state)
-    ps = state["propagation_space"]
-    if "shap_raw" in ps and state["shap_raw_indices"] is not None:
-        sel_cols = state["shap_raw_indices"]
-    elif "shap_all" in ps and state["shap_vals"] is not None:
-        sel_cols = list(range(state["shap_vals"].shape[1]))
-    elif "shap_flags" in ps and state["shap_flag_indices"] is not None:
-        sel_cols = state["shap_flag_indices"]
-    else:
-        raise ValueError("shap_box propagation_mode requires a shap propagation_space (z.B. ['shap_raw'])")
-    if state["shap_vals"] is None:
-        raise ValueError("shap_box needs shap_vals (compute_shap=True / initial_shap via run_unsupervised)")
-    S = state["shap_vals"]
-
-    df, score_col = _uncertainty_scores(df, strategy, state)
-    pool_mask = ~df["posting_id"].isin(state["directly_corrected"])
-    pool = df[pool_mask]
-    if pool.empty:
-        df = df.drop(columns=[score_col])
+    df, box = _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta)
+    if box is None:
         meta["type"] = "no_candidates"
         return df, state, meta
 
-    if selection_mode == "uncertainty_density":
-        if state["T"] is None:
-            state["T"] = estimate_threshold(state, random_state=state.get("seed", 42))
-        if state["neighbor_density"] is None:
-            _compute_neighbor_density(state)
-        pool_idx = pool.index.values
-        uncertainty = pool[score_col].values
-        density = state["neighbor_density"][pool_idx]
-        density_max = density.max()
-        density_norm = density / density_max if density_max > 0 else density
-        combined = uncertainty * density_norm
-        m_pos = pool.index[np.argmax(combined)]
-    else:
-        m_pos = pool[score_col].idxmax()
-    M = df.loc[m_pos, "posting_id"]
-    M_label = int(df.loc[m_pos, "label"])
-    M_pred_score = float(df.loc[m_pos, "pred_score"])
-    M_pred_label = int(df.loc[m_pos, "pred_label"])
-    df = df.drop(columns=[score_col])
-
-    # ---- Decision Space: adaptive entscheidende SHAP-Features (echte Werte).
-    # Baseline = Logit - Summe der SHAP-Beiträge im Zielfeatures-Raum; daraus
-    # kumulieren (vorzeichenbehaftet) und das LETZTE Überqueren der Logit-0
-    # bestimmen. Danach kann der echte Rest das Vorzeichen nicht mehr kippen.
-    M_idx = np.where(state["X_ids"] == M)[0][0]
-    row = S[M_idx, sel_cols]
-    p = min(max(M_pred_score, 1e-7), 1.0 - 1e-7)
-    logit = float(np.log(p / (1.0 - p)))
-    base = logit - float(row.sum())
-    order = np.argsort(-np.abs(row))
-    cum = base + np.cumsum(row[order])
-    tol = 1e-9 * max(1.0, abs(logit))
-    side = np.where(cum >= tol, 1, -1)
-    final = side[-1] if len(side) else 0
-    dev = np.where(side != final)[0]
-    if len(dev):
-        k = int(dev[-1]) + 2  # Prefix bis einschließlich des Features, das die Endseite fixiert
-    else:
-        k = 0  # Entscheidung steht schon bei der Baseline: keine Familie
-    k = int(min(k, len(sel_cols)))
+    S = box["S"]
+    sel_cols = box["sel_cols"]
+    mask = box["mask"]
+    family_size = box["family_size"]
+    col_idx = box["col_idx"]
+    bands = box["bands"]
+    k = box["k"]
+    M = box["M"]
+    M_label = box["M_label"]
+    M_pred_score = box["M_pred_score"]
+    M_pred_label = box["M_pred_label"]
+    M_idx = box["M_idx"]
+    m_pos = box["m_pos"]
     d = min(prop_delta, 0.99)
-
-    mask = np.zeros(len(df), dtype=bool)
-    family_size = 1
-    col_idx = []
-    bands = []
     value_bands = None
+
     if k >= 1:
-        topk = order[:k]
-        col_idx = [sel_cols[t] for t in topk]
-        bands = []
-        for j in col_idx:
-            v = float(S[M_idx, j])
-            if v == 0.0:
-                lo, hi = -1e-9, 1e-9
-            else:
-                lo, hi = sorted((v * (1.0 - d), v * (1.0 + d)))
-            bands.append((lo, hi))
-
-        mask = np.ones(len(df), dtype=bool)
-        for j, (lo, hi) in zip(col_idx, bands):
-            col = S[:, j]
-            mask &= (col >= lo) & (col <= hi)
-        if not mask.any():
-            mask[M_idx] = True  # Fallback: mindestens der Seed selbst
-        family_size = int(mask.sum())
-
         # ---- Feature Space: alle Original-Features (features_raw), ohne Flags.
         if feature_space in ("value_box", "perfect_knowledge"):
             raw = _get_feature_groups(df)["features_raw"]
@@ -471,9 +509,6 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
         if not mask.any():
             mask = np.zeros(len(df), dtype=bool)
             mask[M_idx] = True  # Fallback: nur der Seed
-    else:
-        # k==0: Entscheidung steht bereits an der Baseline -> keine Familie, nur Seed
-        mask[M_idx] = True
 
     prev_pred = df["pred_label"].values.copy()
     covered_idxs = np.where(mask)[0]
@@ -510,6 +545,290 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
     meta["M_density"] = float(state["neighbor_density"][M_idx]) if state["neighbor_density"] is not None else 0.0
     if len(covered_idxs):
         acc = (df.loc[df.index[covered_idxs], "label"].values == M_label).mean()
+        meta["propagation_accuracy"] = float(acc)
+    else:
+        meta["propagation_accuracy"] = 1.0
+
+    return df, state, meta
+
+
+# --- reviewer_box helpers ---
+
+_ORIGINAL_NUM_CONST = ["date_difference"]
+_ORIGINAL_CAT_CONST = ["tax_rate", "user"]
+_ORIGINAL_CAT_EXPANDED = ["gl_account_name", "cd_flag", "promptly", "weekend",
+                          "nwh", "top_n", "high_cash"]
+_ORIGINAL_NUM_EXPANDED = ["amount"]
+
+
+def _map_columns_to_original_features(df):
+    """Map model feature columns back to original (pre-OHE) features.
+
+    Returns {model_col -> (original, kind, slot)} with kind in {"num","cat"}.
+    Numeric expanded columns keep the slot (amount_1..3); categorical constants
+    have no slot (tax_rate_<cat>, user_<cat>); date_difference is numeric const.
+    """
+    consts = _ORIGINAL_NUM_CONST + _ORIGINAL_CAT_CONST
+    expanded = _ORIGINAL_NUM_EXPANDED + _ORIGINAL_CAT_EXPANDED
+    mapping = {}
+    for col in get_feature_cols(df):
+        if col in consts:
+            kind = "num" if col in _ORIGINAL_NUM_CONST else "cat"
+            mapping[col] = (col, kind, None)
+            continue
+        matched = None
+        for orig in sorted(expanded, key=len, reverse=True):
+            if col.startswith(orig + "_"):
+                matched = orig
+                break
+        if matched is None:
+            continue
+        rest = col[len(matched) + 1:]
+        parts = rest.split("_", 1)
+        if not parts[0].isdigit():
+            continue
+        slot = int(parts[0])
+        kind = "cat" if matched in _ORIGINAL_CAT_EXPANDED else "num"
+        mapping[col] = (matched, kind, slot)
+    return mapping
+
+
+def _build_feature_units(df, col_idx, all_features):
+    """Group SHAP-box model columns into original feature units (for the rule)."""
+    mapping = _map_columns_to_original_features(df)
+    units = {}
+    for j in col_idx:
+        info = mapping.get(all_features[j])
+        if info is None:
+            continue
+        orig, kind, slot = info
+        units.setdefault((orig, kind, slot), set()).add(all_features[j])
+    return {key: sorted(cols) for key, cols in units.items()}
+
+
+def _select_representatives(S, mask, M_idx, col_idx, n, strategy, seed, exclude_idx=None):
+    """Label-free, diversity-driven selection of representative family members."""
+    cand = np.where(mask)[0]
+    cand = cand[cand != M_idx]
+    if exclude_idx is not None and len(exclude_idx):
+        cand = cand[~np.isin(cand, exclude_idx)]
+    if n <= 0 or len(cand) == 0:
+        return []
+    if len(col_idx) == 0:
+        return [int(i) for i in sorted(cand)[:n]]
+    sub = S[:, col_idx]
+    if len(cand) <= n:
+        d = np.linalg.norm(sub[cand] - sub[M_idx], axis=1)
+        order = np.lexsort((cand, -d))
+        return [int(cand[p]) for p in order]
+    if strategy == "random":
+        rng = np.random.RandomState(seed)
+        return [int(i) for i in rng.choice(cand, size=n, replace=False)]
+    if strategy == "kmeans_medoid":
+        km = KMeans(n_clusters=n, n_init=10, random_state=seed)
+        labels = km.fit_predict(sub[cand])
+        reps = []
+        for c in range(n):
+            members = cand[labels == c]
+            if len(members) == 0:
+                continue
+            ctr = km.cluster_centers_[c]
+            dist = np.linalg.norm(sub[members] - ctr, axis=1)
+            reps.append(int(members[int(np.argmin(dist))]))
+        return reps
+    # farthest_point (default): greedy k-center from the seed
+    d_seed = np.linalg.norm(sub[cand] - sub[M_idx], axis=1)
+    chosen = [int(cand[int(np.lexsort((cand, -d_seed))[0])])]
+    min_d = np.linalg.norm(sub[cand] - sub[chosen[0]], axis=1)
+    while len(chosen) < n:
+        dd = min_d.copy()
+        for c in chosen:
+            dd[cand == c] = -1.0
+        if (dd < 0).all():
+            break
+        nxt = int(cand[int(np.lexsort((cand, -dd))[0])])
+        chosen.append(nxt)
+        min_d = np.minimum(min_d, np.linalg.norm(sub[cand] - sub[nxt], axis=1))
+    return chosen
+
+
+def _active_category(df, cols, case_idx):
+    vals = df[cols].values[case_idx]
+    nz = np.where(vals == 1)[0]
+    return cols[int(nz[0])] if len(nz) else None
+
+
+def _derive_reviewer_value_rule(df, seed_idx, accepted, rejected, units, prop_delta):
+    """Derive a conservative feature-space rule from reviewed representatives.
+
+    Returns a list of constraints (strict conjunction) or None when no
+    discriminating feature could be established from the reviewed cases only.
+    Numeric units: interval [min_A - pad, max_A + pad] (pad from prop_delta),
+    kept only if some rejected value falls outside. Categorical units: excluded
+    categories = rejected active cats not present in any accepted case, kept
+    only if non-empty.
+    """
+    accepted = list(dict.fromkeys(list(accepted) + [seed_idx]))
+    rejected = list(dict.fromkeys(list(rejected)))
+    if len(rejected) == 0:
+        return None
+    rule = []
+    for (orig, kind, slot), cols in units.items():
+        if kind == "num":
+            col = cols[0]
+            a = df[col].values[accepted]
+            r = df[col].values[rejected]
+            min_a, max_a = float(a.min()), float(a.max())
+            span = max_a - min_a
+            if span > 0:
+                pad = prop_delta * span
+            else:
+                base = max(abs(min_a), abs(max_a))
+                pad = prop_delta * base if base > 0 else prop_delta
+            lo, hi = min_a - pad, max_a + pad
+            if not np.any((r < lo) | (r > hi)):
+                continue
+            rule.append({"kind": "num", "orig": orig, "slot": slot,
+                         "col": col, "lo": float(lo), "hi": float(hi)})
+        else:
+            allowed = {_active_category(df, cols, i) for i in accepted}
+            allowed.discard(None)
+            excluded = set()
+            for i in rejected:
+                act = _active_category(df, cols, i)
+                if act is not None and act not in allowed:
+                    excluded.add(act)
+            if not excluded:
+                continue
+            rule.append({"kind": "cat", "orig": orig, "slot": slot,
+                         "exclude": sorted(excluded)})
+    return rule if rule else None
+
+
+def _apply_value_rule(df, mask, rule):
+    m = mask.copy()
+    for r in rule:
+        if r["kind"] == "num":
+            vals = df[r["col"]].values
+            m &= (vals >= r["lo"]) & (vals <= r["hi"])
+        else:
+            for c in r["exclude"]:
+                m &= (df[c].values != 1)
+    return m
+
+
+def reviewer_box_iteration(df, strategy, state, selection_mode="uncertainty",
+                           n_representatives=3, rep_selection="farthest_point",
+                           fallback="family", prop_delta=0.25):
+    """reviewer_box: SHAP-Box-Kandidatenfamilie + reviewer-informierter Feature-Space-Filter.
+
+    Seed und Kandidatenfamilie identisch zu shap_box. Zusätzlich werden
+    n_representatives weitere Fälle aus der Familie simuliert geprüft (label-frei
+    nach Diversität im SHAP-Raum gewählt); daraus wird eine sparsame
+    Feature-Space-Regel abgeleitet (nur trennende Original-Features), die die
+    Familie einschränkt. Keine Regel ableitbar -> Fallback ("family" = volle
+    SHAP-Box-Familie, "seed_only" = nur der Seed). Reviewte Reps erhalten
+    direkt_corrected (HITL-Gewichtung), behalten aber ihr Prüfer-Label und
+    werden nicht mit M_label propagiert.
+    """
+    meta = {}
+    df, box = _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta)
+    if box is None:
+        meta["type"] = "no_candidates"
+        return df, state, meta
+
+    S = box["S"]
+    sel_cols = box["sel_cols"]
+    mask = box["mask"]
+    family_size = box["family_size"]
+    col_idx = box["col_idx"]
+    bands = box["bands"]
+    k = box["k"]
+    M = box["M"]
+    M_label = box["M_label"]
+    M_pred_score = box["M_pred_score"]
+    M_pred_label = box["M_pred_label"]
+    M_idx = box["M_idx"]
+
+    ids = state["X_ids"]
+    all_features = get_feature_cols(df)
+    units = _build_feature_units(df, col_idx, all_features)
+
+    # 1) Repräsentanten wählen (label-frei, ohne bereits geprüfte Fälle) und
+    #    simulierten Prüfer anwenden (Urteil = echtes Label der Reps).
+    reviewed_set = set(str(p) for p in state.get("directly_corrected", set()))
+    exclude_idx = np.array([i for i in range(len(ids)) if str(ids[i]) in reviewed_set],
+                           dtype=int)
+    reps = _select_representatives(S, mask, M_idx, col_idx, n_representatives,
+                                   rep_selection, state.get("seed", 42), exclude_idx)
+    accepted = []
+    rejected = []
+    rep_labels = {}
+    for ridx in reps:
+        r_label = int(df.iloc[ridx]["label"])
+        rep_labels[int(ridx)] = r_label
+        df.loc[df.index[ridx], "pred_label"] = r_label
+        state["directly_corrected"].add(ids[ridx])
+        if r_label == M_label:
+            accepted.append(int(ridx))
+        else:
+            rejected.append(int(ridx))
+
+    # 2) Feature-Space-Regel aus den reviewten Reps ableiten
+    rule = _derive_reviewer_value_rule(df, M_idx, accepted, rejected, units, prop_delta)
+    fallback_used = False
+    if rule is None:
+        fallback_used = True
+        if fallback == "seed_only":
+            mask = np.zeros(len(df), dtype=bool)
+            mask[M_idx] = True
+        # "family": SHAP-Box-Familie unverändert propagieren
+    else:
+        mask = _apply_value_rule(df, mask, rule)
+        if not mask.any():
+            mask[M_idx] = True
+
+    # 3) Propagation: nur Familie OHNE reviewte Reps (deren Label ist bereits korrekt)
+    prev_pred = df["pred_label"].values.copy()
+    rep_set = set(rep_labels.keys())
+    prop_idxs = np.array([i for i in np.where(mask)[0] if i not in rep_set], dtype=int)
+    if len(prop_idxs):
+        df.loc[df.index[prop_idxs], "pred_label"] = M_label
+
+    state["covered"] |= set(ids[mask])
+    state["directly_corrected"].add(M)
+    state["covered_arr"] = mask
+    state["nearest_dist"] = None
+
+    changed = df["pred_label"].values != prev_pred
+    meta["M"] = M
+    meta["M_label"] = M_label
+    meta["M_pred_score"] = M_pred_score
+    meta["M_pred_label"] = M_pred_label
+    meta["type"] = "skip" if not bool(changed.any()) else "rule"
+    meta["fallback_used"] = fallback_used
+    meta["n_representatives"] = int(len(reps))
+    meta["n_accepted"] = int(len(accepted))
+    meta["n_rejected"] = int(len(rejected))
+    meta["reviewed_representatives"] = [str(ids[r]) for r in reps]
+    meta["n_rule_features"] = int(len(rule)) if rule else 0
+    meta["reviewer_rule"] = rule
+    meta["rule"] = {
+        "features": [all_features[j] for j in col_idx],
+        "bands": [[lo, hi] for lo, hi in bands],
+        "k": k,
+        "delta": prop_delta,
+        "feature_space": "reviewer",
+        "family_size": family_size,
+    }
+    meta["n_covered"] = int(len(prop_idxs))
+    meta["cumulative_direct"] = len(state["directly_corrected"])
+    meta["n_flipped"] = int(changed.sum())
+    meta["prop_dims"] = len(sel_cols)
+    meta["selection_mode"] = selection_mode
+    meta["M_density"] = float(state["neighbor_density"][M_idx]) if state["neighbor_density"] is not None else 0.0
+    if len(prop_idxs):
+        acc = (df.loc[df.index[prop_idxs], "label"].values == M_label).mean()
         meta["propagation_accuracy"] = float(acc)
     else:
         meta["propagation_accuracy"] = 1.0
@@ -814,7 +1133,7 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
         state["candidate_case_to_basket"] = dict(state["case_to_basket"])
         case_labels = dict(zip(
             df["posting_id"].astype(str),
-            df["label"].astype(int),
+            df["pred_label"].astype(int),
         ))
         allowed = {
             pid: bid for pid, bid in state["case_to_basket"].items()
@@ -908,7 +1227,7 @@ def label_consistent_basket_iteration(df, strategy, state, selection_mode="uncer
                 i for i, pid in enumerate(ids)
                 if state["candidate_case_to_basket"].get(str(pid)) == b["id"]
                 and str(pid) not in reviewed
-                and int(df.iloc[i]["label"]) != b["label"]
+                and int(df.iloc[i]["pred_label"]) != b["label"]
             ]
             if not conflict:
                 continue
