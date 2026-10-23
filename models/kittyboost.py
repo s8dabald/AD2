@@ -4,6 +4,20 @@ import numpy as np
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, classification_report
 
 
+def compute_path_groups(model, df):
+    """Group-ID je Zeile: Faelle mit identischem Leaf-Pfad durch ALLE Baeume.
+
+    Gleicher Pfad => gleiche Features in jedem Split => identische Vorhersage.
+    Rueckgabe: numpy-Array (Gruppennummern 0..n_groups-1) in Zeilenreihenfolge von df.
+    """
+    X = df.drop(columns=["label", "posting_id", "pred_label", "pred_score"])
+    leaf_idx = np.asarray(model.calc_leaf_indexes(Pool(X)))
+    cont = np.ascontiguousarray(leaf_idx)
+    key = cont.view(np.dtype((np.void, cont.dtype.itemsize * cont.shape[1]))).ravel()
+    _, inverse = np.unique(key, return_inverse=True)
+    return inverse
+
+
 def train_catboost(df, verbose = False, incremental = False, inc_model = None, full_data = None, corrected_ids = None,corrected_weights=100, compute_shap=False, sample_weights=None, incremental_iters=20, early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2, seed=42):
     # Trainiere auf generated_label, evaluiere auf true label
     y_train_target = df["pred_label"].astype(int)  # Trainiere auf Rules

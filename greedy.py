@@ -87,7 +87,11 @@ def new_state(T=None, propagation_space=None, seed=42):
     "shap_scaler": None,
     "shap_std_cache": None,
     "shap_std_id": None,
-    "_ideal_map": None,
+        "topk_pos": None,
+        "topk_k": None,
+        "topk_fallback": False,
+        "path_groups": None,
+        "_ideal_map": None,
     "_ideal_names": None,
 }
 
@@ -327,12 +331,122 @@ def greedy_iteration(df, strategy, state, selection_mode="uncertainty"):
     return df, state, meta
 
 
-def _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta):
+def path_group_iteration(df, strategy, state, selection_mode="uncertainty"):
+    """One iteration of path-group propagation: review the most uncertain case and
+    propagate its label to all cases that share its leaf path through all trees.
+
+    Same seed logic as the other propagation modes (most uncertain, not yet
+    directly corrected). The seed is the only directly corrected case (gets
+    corrected_weights); propagated group members stay at weight 1. Already
+    reviewed cases are never overwritten.
+
+    Needs state["path_groups"] (Series posting_id -> group id) and no SHAP.
+
+    Returns: (df_updated, state_updated, meta)
+    """
+    meta = {}
+
+    if state.get("path_groups") is None:
+        meta["type"] = "no_candidates"
+        return df, state, meta
+
+    df, score_col = _uncertainty_scores(df, strategy, state)
+    pool_mask = ~df["posting_id"].isin(state["directly_corrected"])
+    pool = df[pool_mask]
+    if pool.empty:
+        df = df.drop(columns=[score_col])
+        meta["type"] = "no_candidates"
+        return df, state, meta
+
+    if selection_mode == "uncertainty_density":
+        if state["T"] is None:
+            state["T"] = estimate_threshold(state, random_state=state.get("seed", 42))
+        if state["neighbor_density"] is None:
+            _compute_neighbor_density(state)
+        pool_idx = pool.index.values
+        uncertainty = pool[score_col].values
+        density = state["neighbor_density"][pool_idx]
+        density_max = density.max()
+        density_norm = density / density_max if density_max > 0 else density
+        combined = uncertainty * density_norm
+        m_pos = pool.index[np.argmax(combined)]
+    else:
+        m_pos = pool[score_col].idxmax()
+
+    M = df.loc[m_pos, "posting_id"]
+    M_label = int(df.loc[m_pos, "label"])
+    M_pred_score = float(df.loc[m_pos, "pred_score"])
+    M_pred_label = int(df.loc[m_pos, "pred_label"])
+    df = df.drop(columns=[score_col])
+
+    grp = df["posting_id"].map(state["path_groups"])
+    group_id = grp.loc[m_pos]
+    in_group = grp == group_id
+    reviewed = df["posting_id"].isin(state["directly_corrected"])
+    target = in_group & ~reviewed
+
+    prev_pred = df["pred_label"].values.copy()
+    df.loc[target, "pred_label"] = M_label
+    state["directly_corrected"].add(M)
+
+    labels = df.loc[target, "label"].astype(int).to_numpy()
+    n_target = int(len(labels))
+    n_mixed = int((labels != M_label).sum())
+
+    meta["type"] = "path_group"
+    meta["M"] = M
+    meta["M_label"] = M_label
+    meta["M_pred_score"] = M_pred_score
+    meta["M_pred_label"] = M_pred_label
+    meta["group_size"] = int(in_group.sum())
+    meta["n_covered"] = n_target
+    meta["n_flipped"] = int((df["pred_label"].values != prev_pred).sum())
+    meta["propagation_accuracy"] = float((labels == M_label).mean()) if n_target else 1.0
+    meta["n_mixed"] = n_mixed
+    meta["cumulative_direct"] = len(state["directly_corrected"])
+    meta["selection_mode"] = selection_mode
+    return df, state, meta
+
+
+def _adaptive_topk(row, pred_score):
+    """Positions (Index in row/sel_cols) des entscheidungsrelevanten SHAP- prefixes.
+
+    Logit-Baseline = logit(pred_score) - Summe(SHAP); kumuliert vorzeichenbehaftet,
+    das letzte Ueberqueren der Logit-0 bestimmt den k-Hat. Reine SHAP/Score-Logik
+    (kein Label). Gibt (k, order[:k]) zurueck; k=0 heisst Baseline entscheidet
+    bereits -> kein Top-k (Fallback: voller Raum).
+    """
+    p = min(max(pred_score, 1e-7), 1.0 - 1e-7)
+    logit = float(np.log(p / (1.0 - p)))
+    base = logit - float(row.sum())
+    order = np.argsort(-np.abs(row))
+    cum = base + np.cumsum(row[order])
+    tol = 1e-9 * max(1.0, abs(logit))
+    side = np.where(cum >= tol, 1, -1)
+    final = side[-1] if len(side) else 0
+    dev = np.where(side != final)[0]
+    if len(dev):
+        k = int(dev[-1]) + 2  # Prefix bis einschliesslich des Features, das die Endseite fixiert
+    else:
+        k = 0  # Entscheidung steht schon bei der Baseline: keine Familie
+    k = int(min(k, len(row)))
+    return k, order[:k]
+
+
+def _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta,
+                       case_delta_mode=False):
     """Shared seed selection + adaptive SHAP decision-space box (candidate family).
 
     Used by shap_box (reviewer_rule_propagate) and reviewer_box. Returns (df, info);
     info is None when the review pool is empty (no candidates). Does NOT apply any
     feature-space (value) filter.
+
+    case_delta_mode=True (shap_box_u): box half-width is per CANDIDATE, derived
+    from the candidate's uncertainty RANK u_rank_i in [0, 1]:
+        delta_i = 0.5 * clip((u_rank_i - 0.5) / 0.5, 0, 1)
+    The bottom 50% get delta=0 (only exact SHAP twins); the top 50% ramp from
+    0 to 0.5. Only error seeds expand, only same-prediction candidates are
+    admitted, and directly reviewed cases are never overwritten.
     """
     _ensure_propagation(df, state)
     ps = state["propagation_space"]
@@ -373,6 +487,10 @@ def _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta):
     M_label = int(df.loc[m_pos, "label"])
     M_pred_score = float(df.loc[m_pos, "pred_score"])
     M_pred_label = int(df.loc[m_pos, "pred_label"])
+    u_all = df[score_col].values.astype(float)
+    u_rank_all = (df[score_col].rank(method="average", pct=True).values.astype(float)
+                  if case_delta_mode else None)
+    u_seed = float(df.loc[m_pos, score_col])
     df = df.drop(columns=[score_col])
 
     # ---- Decision Space: adaptive entscheidende SHAP-Features (echte Werte).
@@ -381,28 +499,21 @@ def _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta):
     # bestimmen. Danach kann der echte Rest das Vorzeichen nicht mehr kippen.
     M_idx = np.where(state["X_ids"] == M)[0][0]
     row = S[M_idx, sel_cols]
-    p = min(max(M_pred_score, 1e-7), 1.0 - 1e-7)
-    logit = float(np.log(p / (1.0 - p)))
-    base = logit - float(row.sum())
-    order = np.argsort(-np.abs(row))
-    cum = base + np.cumsum(row[order])
-    tol = 1e-9 * max(1.0, abs(logit))
-    side = np.where(cum >= tol, 1, -1)
-    final = side[-1] if len(side) else 0
-    dev = np.where(side != final)[0]
-    if len(dev):
-        k = int(dev[-1]) + 2  # Prefix bis einschliesslich des Features, das die Endseite fixiert
+    k, topk = _adaptive_topk(row, M_pred_score)
+    if case_delta_mode:
+        rank_scaled = np.clip((u_rank_all - 0.5) / 0.5, 0.0, 1.0)
+        delta_all = 0.5 * rank_scaled
     else:
-        k = 0  # Entscheidung steht schon bei der Baseline: keine Familie
-    k = int(min(k, len(sel_cols)))
-    d = min(prop_delta, 0.99)
+        delta_all = np.full(len(df), min(prop_delta, 0.99))
+    delta_seed = float(delta_all[M_idx])
+    u_rank_seed = float(u_rank_all[M_idx]) if case_delta_mode else None
+    d = delta_seed
 
     mask = np.zeros(len(df), dtype=bool)
     family_size = 1
     col_idx = []
     bands = []
     if k >= 1:
-        topk = order[:k]
         col_idx = [sel_cols[t] for t in topk]
         bands = []
         for j in col_idx:
@@ -414,9 +525,14 @@ def _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta):
             bands.append((lo, hi))
 
         mask = np.ones(len(df), dtype=bool)
-        for j, (lo, hi) in zip(col_idx, bands):
-            col = S[:, j]
-            mask &= (col >= lo) & (col <= hi)
+        for j in col_idx:
+            v = float(S[M_idx, j])
+            if v == 0.0:
+                mask &= np.abs(S[:, j]) <= 1e-9
+                continue
+            lo = v * (1.0 - delta_all)
+            hi = v * (1.0 + delta_all)
+            mask &= (S[:, j] >= np.minimum(lo, hi)) & (S[:, j] <= np.maximum(lo, hi))
         if not mask.any():
             mask[M_idx] = True  # Fallback: mindestens der Seed selbst
         family_size = int(mask.sum())
@@ -424,16 +540,30 @@ def _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta):
         # k==0: Entscheidung steht bereits an der Baseline -> keine Familie, nur Seed
         mask[M_idx] = True
 
+    if case_delta_mode:
+        mask &= df["pred_label"].values == M_pred_label
+        reviewed = df["posting_id"].isin(state["directly_corrected"]).values
+        reviewed[M_idx] = False
+        mask &= ~reviewed
+        if M_label == M_pred_label:
+            mask[:] = False
+        mask[M_idx] = True
+        family_size = int(mask.sum())
+
     return df, {
         "S": S, "sel_cols": sel_cols, "mask": mask, "family_size": family_size,
         "col_idx": col_idx, "bands": bands, "k": k, "M": M, "M_label": M_label,
         "M_pred_score": M_pred_score, "M_pred_label": M_pred_label,
-        "M_idx": M_idx, "m_pos": m_pos,
+        "M_idx": M_idx, "m_pos": m_pos, "u_all": u_all, "u_seed": u_seed,
+        "u_rank_all": u_rank_all, "u_rank_seed": u_rank_seed,
+        "delta_all": delta_all, "delta_seed": delta_seed,
+        "case_delta_mode": case_delta_mode,
     }
 
 
 def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
-                            prop_k=2, prop_delta=0.25, feature_space="off"):
+                            prop_k=2, prop_delta=0.25, feature_space="off",
+                            case_delta_mode=False):
     """Prüfer-Regel-Propagation (shap_box, adaptive Feature-Selektion): Statt
     Kugel/Voronoi baut der simulierte Prüfer aus der SHAP-Erklärung des reviewed
     Seeds eine Regel in zwei Ebenen.
@@ -452,14 +582,27 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
         echtes Label == Prüfer-Urteil über den Seed (min-max pro Original-Feature).
         Simuliert den Prüfer mit perfekter Kenntnis des gültigen Wertebereichs.
 
-    Propagiert wird das Seed-Label auf die finalen Cases (last-writer-wins). Ist
-    die Region leer, wird nur der Seed selbst korrigiert. Prüfer-Urteil/True Labels
-    fließen NUR bei feature_space="perfect_knowledge" ein — nie in die SHAP-Auswahl.
+    case_delta_mode=True (shap_box_u): Die Bandbreite ist nicht fix, sondern
+    pro KANDIDAT aus dessen Unsicherheits-RANG u_rank_i in [0,1] abgeleitet:
+    delta_i = 0.5 * clip((u_rank_i - 0.5) / 0.5, 0, 1). Die unteren 50% werden
+    nie verbreitert (delta=0, nur exakte SHAP-Zwillinge); die oberen 50% rampen
+    von 0 bis 0.5. Zusaetzlich expandieren nur Error-Seeds, nur Kandidaten mit
+    gleicher Vorhersage, und direkt reviewte Cases werden nie ueberschrieben.
+    Nur mit feature_space="off" kombinierbar.
+
+    Propagiert wird das Seed-Label auf die finalen Cases (last-writer-wins, ausser
+    bei case_delta_mode: direkt reviewte Cases bleiben geschuetzt). Ist die Region
+    leer, wird nur der Seed selbst korrigiert. Prüfer-Urteil/True Labels fließen
+    NUR bei feature_space="perfect_knowledge" ein — nie in die SHAP-Auswahl.
     Braucht greedy_batching=True mit shap propagation_space.
     """
     meta = {}
 
-    df, box = _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta)
+    if case_delta_mode and feature_space != "off":
+        raise ValueError("shap_box_u (case_delta_mode) requires feature_space='off'")
+
+    df, box = _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta,
+                                 case_delta_mode=case_delta_mode)
     if box is None:
         meta["type"] = "no_candidates"
         return df, state, meta
@@ -477,7 +620,10 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
     M_pred_label = box["M_pred_label"]
     M_idx = box["M_idx"]
     m_pos = box["m_pos"]
-    d = min(prop_delta, 0.99)
+    delta_seed = box["delta_seed"]
+    u_seed = box["u_seed"]
+    u_rank_seed = box.get("u_rank_seed")
+    d = delta_seed if case_delta_mode else min(prop_delta, 0.99)
     value_bands = None
 
     if k >= 1:
@@ -522,17 +668,47 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
     state["nearest_dist"] = None
 
     changed = df["pred_label"].values != prev_pred
+    true_labels = df["label"].values.astype(int)
+    new_pred = df["pred_label"].values
+    n_changed_correct = int((changed & (new_pred == true_labels)).sum())
+    n_changed_wrong = int((changed & (new_pred != true_labels)).sum())
     all_features = get_feature_cols(df)
+    delta_covered = None
+    u_covered = None
+    if case_delta_mode and len(covered_idxs):
+        dc = box["delta_all"][covered_idxs]
+        uc = box["u_all"][covered_idxs]
+        delta_covered = {
+            "min": float(np.min(dc)),
+            "median": float(np.median(dc)),
+            "max": float(np.max(dc)),
+        }
+        u_covered = {
+            "min": float(np.min(uc)),
+            "median": float(np.median(uc)),
+            "max": float(np.max(uc)),
+        }
     meta["M"] = M
     meta["M_label"] = M_label
     meta["M_pred_score"] = M_pred_score
     meta["M_pred_label"] = M_pred_label
+    meta["M_uncertainty"] = float(u_seed)
+    meta["delta_seed"] = float(delta_seed)
+    meta["delta_covered"] = delta_covered
+    meta["covered_u"] = u_covered
+    meta["case_delta_mode"] = case_delta_mode
+    if case_delta_mode:
+        meta["M_uncertainty_rank"] = None if u_rank_seed is None else float(u_rank_seed)
+        meta["n_changed_correct"] = n_changed_correct
+        meta["n_changed_wrong"] = n_changed_wrong
     meta["type"] = "skip" if not bool(changed.any()) else "rule"
     meta["rule"] = {
         "features": [all_features[j] for j in col_idx],
         "bands": [[lo, hi] for lo, hi in bands],
         "k": k,
-        "delta": prop_delta,
+        "delta": float(delta_seed) if case_delta_mode else prop_delta,
+        "delta_mode": "uncertainty_rank" if case_delta_mode else "fixed",
+        "delta_covered": delta_covered,
         "feature_space": feature_space,
         "family_size": family_size,
     }
@@ -1013,7 +1189,7 @@ def _ensure_basket_centroids(state, S_std, ids):
         b["centroid_std"] = S_std[idxs].mean(axis=0) if idxs else np.zeros(dimension)
 
 
-def _assign_unreviewed(state, S_std, ids):
+def _assign_unreviewed(state, S_std, ids, positions=None):
     if S_std is None or len(state["pipeline_baskets"]) == 0:
         return
     _ensure_basket_centroids(state, S_std, ids)
@@ -1024,18 +1200,24 @@ def _assign_unreviewed(state, S_std, ids):
     # build centroids matrix
     cents = np.stack([b["centroid_std"] for b in state["pipeline_baskets"]], axis=0)
     b_ids = [b["id"] for b in state["pipeline_baskets"]]
+    if positions is not None and len(positions):
+        S_use = S_std[:, positions]
+        cents_use = cents[:, positions]
+    else:
+        S_use = S_std
+        cents_use = cents
     for i, pid in enumerate(ids):
         src = state["case_source"].get(str(pid))
         if src == "reviewed":
             continue
-        d = ((S_std[i] - cents) ** 2).sum(axis=1)
+        d = ((S_use[i] - cents_use) ** 2).sum(axis=1)
         j = int(np.argmin(d))
         state["case_to_basket"][str(pid)] = b_ids[j]
         state["case_source"][str(pid)] = "propagated"
 
 
 def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty", basket_alpha=0.5,
-                              label_consistent=False, decision_provider=None):
+                              label_consistent=False, decision_provider=None, adaptive_topk=False):
     meta = {}
 
     _ensure_propagation(df, state)
@@ -1068,7 +1250,7 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
         meta["type"] = "no_candidates"
         return df, state, meta
 
-    # compute basket_fit: dist to assigned basket
+    # compute basket_fit: dist to assigned basket (adaptive_topk: vorheriger Seed-topk-Raum)
     if S_std is not None and len(state["pipeline_baskets"]) > 0:
         id_to_idx = {pid: i for i, pid in enumerate(ids)}
         cents = np.stack([b["centroid_std"] for b in state["pipeline_baskets"]], axis=0)
@@ -1076,11 +1258,16 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
         # map id->basket
         id_to_b = state["case_to_basket"]
         d_to_b = np.full(len(ids), np.inf)
+        pos = state.get("topk_pos") if adaptive_topk else None
         for i, pid in enumerate(ids):
             bid = id_to_b.get(str(pid))
             if bid is not None:
                 j = b_ids_list.index(bid) if bid in b_ids_list else 0
-                d_to_b[i] = ((S_std[i] - cents[j]) ** 2).sum() ** 0.5
+                if pos is not None:
+                    diff = S_std[i, pos] - cents[j, pos]
+                else:
+                    diff = S_std[i] - cents[j]
+                d_to_b[i] = (diff ** 2).sum() ** 0.5
     else:
         d_to_b = np.zeros(len(ids))
 
@@ -1092,6 +1279,13 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
     m_pos = pool.index[np.argmax(combined)]
     M = df.loc[m_pos, "posting_id"]
     M_str = str(M)
+
+    if adaptive_topk:
+        M_idx = int(np.where(ids == M)[0][0])
+        k_top, pos_top = _adaptive_topk(S_raw[M_idx], float(df.loc[m_pos, "pred_score"]))
+        state["topk_k"] = int(k_top)
+        state["topk_pos"] = pos_top if k_top >= 1 else None
+        state["topk_fallback"] = k_top < 1
 
     # determine basket from ideal
     ideal_bid, ideal_label, ideal_name = _oracle_basket_for(M)
@@ -1127,7 +1321,8 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
 
     _update_basket_centroids(state, S_std, ids)
     bid_to_label = {b["id"]: b["label"] for b in state["pipeline_baskets"]}
-    _assign_unreviewed(state, S_std, ids)
+    _assign_unreviewed(state, S_std, ids,
+                       positions=state.get("topk_pos") if adaptive_topk else None)
     prev_pred = df["pred_label"].values.copy()
     if label_consistent:
         state["candidate_case_to_basket"] = dict(state["case_to_basket"])
@@ -1181,18 +1376,24 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
         }
         for b in state["pipeline_baskets"]
     ]
-
+    if adaptive_topk:
+        all_features = get_feature_cols(df)
+        pos = state.get("topk_pos")
+        meta["adaptive_topk"] = True
+        meta["topk_k"] = state.get("topk_k")
+        meta["topk_features"] = [all_features[sel_cols[t]] for t in pos] if pos is not None else []
+        meta["topk_fallback"] = bool(state.get("topk_fallback"))
     df = df.drop(columns=[score_col])
     return df, state, meta
 
 
 def label_consistent_basket_iteration(df, strategy, state, selection_mode="uncertainty",
-                                      basket_alpha=0.5, decision_provider=None):
+                                      basket_alpha=0.5, decision_provider=None, adaptive_topk=False):
     if state["phase"] == "review":
         df, state, meta = cluster_baskets_iteration(
             df, strategy, state, selection_mode=selection_mode,
             basket_alpha=basket_alpha, label_consistent=True,
-            decision_provider=decision_provider)
+            decision_provider=decision_provider, adaptive_topk=adaptive_topk)
         if meta.get("type") == "review_required":
             meta["phase"] = "review"
             meta["force_retrain"] = False
@@ -1211,11 +1412,19 @@ def label_consistent_basket_iteration(df, strategy, state, selection_mode="uncer
     _ensure_basket_centroids(state, S_std, ids)
     prev_pred = df["pred_label"].values.copy()
 
+    topk_pos = state.get("topk_pos") if adaptive_topk else None
+
     if not state["conflict_confirmations"]:
         cents = np.stack([b["centroid_std"] for b in state["pipeline_baskets"]], axis=0)
         basket_ids = [b["id"] for b in state["pipeline_baskets"]]
+        if topk_pos is not None:
+            S_use = S_std[:, topk_pos]
+            cents_use = cents[:, topk_pos]
+        else:
+            S_use = S_std
+            cents_use = cents
         nearest = np.argmin(
-            ((S_std[:, None, :] - cents[None, :, :]) ** 2).sum(axis=2),
+            ((S_use[:, None, :] - cents_use[None, :, :]) ** 2).sum(axis=2),
             axis=1,
         )
         state["candidate_case_to_basket"] = {
@@ -1234,16 +1443,26 @@ def label_consistent_basket_iteration(df, strategy, state, selection_mode="uncer
             if len(conflict) == 1:
                 chosen = conflict
             else:
+                if topk_pos is not None:
+                    S_conf = S_std[conflict][:, topk_pos]
+                    cen_conf = b["centroid_std"][topk_pos]
+                else:
+                    S_conf = S_std[conflict]
+                    cen_conf = b["centroid_std"]
                 km = KMeans(n_clusters=2, n_init=10, random_state=state.get("seed", 42))
-                sub_labels = km.fit_predict(S_std[conflict])
+                sub_labels = km.fit_predict(S_conf)
                 sub_centers = km.cluster_centers_
                 target = int(np.argmin(np.linalg.norm(
-                    sub_centers - b["centroid_std"], axis=1)))
+                    sub_centers - cen_conf, axis=1)))
                 chosen = [idx for idx, sub in zip(conflict, sub_labels) if sub == target]
-            representative = min(
-                chosen,
-                key=lambda idx: float(np.linalg.norm(S_std[idx] - b["centroid_std"])),
-            )
+            if topk_pos is not None:
+                rep_vecs = S_std[chosen][:, topk_pos]
+                rep_cen = b["centroid_std"][topk_pos]
+            else:
+                rep_vecs = S_std[chosen]
+                rep_cen = b["centroid_std"]
+            representative = chosen[int(np.argmin(np.linalg.norm(
+                rep_vecs - rep_cen, axis=1)))]
             state["conflict_confirmations"].append({
                 "basket_id": b["id"],
                 "case_ids": [str(ids[idx]) for idx in chosen],
@@ -1331,6 +1550,8 @@ def label_consistent_basket_iteration(df, strategy, state, selection_mode="uncer
             "n_reviewed": len(state["directly_corrected"]),
             "n_flipped": int((df["pred_label"].values != prev_pred).sum()),
             "baskets": [],
+            "topk_k": state.get("topk_k"),
+            "topk_fallback": bool(state.get("topk_fallback")),
         }
     else:
         state["phase"] = "review"
@@ -1343,6 +1564,8 @@ def label_consistent_basket_iteration(df, strategy, state, selection_mode="uncer
             "n_reviewed": len(state["directly_corrected"]),
             "n_flipped": 0,
             "baskets": [],
+            "topk_k": state.get("topk_k"),
+            "topk_fallback": bool(state.get("topk_fallback")),
         }
     for b in state["pipeline_baskets"]:
         total = sum(1 for bid in state["case_to_basket"].values() if bid == b["id"])

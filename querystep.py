@@ -41,12 +41,12 @@ def uncertainty_query(df, strategy = "margin", exclude_posting_ids=None, novelty
     if strategy == "margin":
         df = margin_uncertainty(df, df['pred_score'])
         filtered = df[~df['posting_id'].isin(exclude_posting_ids)]
-        filtered = filtered.sort_values("margin_uncertainty", ascending=False).head(10)
+        filtered = filtered.sort_values("margin_uncertainty", ascending=False).head(1)
         return filtered.drop(columns=["margin_uncertainty"])
     elif strategy == "entropy": 
         df = entropy_uncertainty(df, df['pred_score'])
         filtered = df[~df['posting_id'].isin(exclude_posting_ids)]
-        filtered = filtered.sort_values("entropy_uncertainty", ascending=False).head(10)
+        filtered = filtered.sort_values("entropy_uncertainty", ascending=False).head(1)
         return filtered.drop(columns=["entropy_uncertainty"])
     elif strategy == "novelty":
         if novelty_scores is None:
@@ -54,5 +54,5 @@ def uncertainty_query(df, strategy = "margin", exclude_posting_ids=None, novelty
         else:
             df["novelty_uncertainty"] = novelty_scores
         filtered = df[~df['posting_id'].isin(exclude_posting_ids)]
-        filtered = filtered.sort_values("novelty_uncertainty", ascending=False).head(10)
+        filtered = filtered.sort_values("novelty_uncertainty", ascending=False).head(1)
         return filtered.drop(columns=["novelty_uncertainty"])
