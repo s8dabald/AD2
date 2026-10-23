@@ -840,7 +840,8 @@ if __name__ == "__main__":
     # --- shap_box_u (I5): shap_box-Familie, delta pro Kandidat aus Unsicherheits-RANG;
     # untere 50% delta=0, obere 50% ramp 0..0.5; nur Error-Seeds, same-pred, reviewed geschuetzt ---
     for se in seeds:
-        df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=25, propagation_mode="shap_box_u", seed=se)
+        df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=10, propagation_mode="shap_box_u", seed=se)
+        df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=10, propagation_mode="shap_box", seed=se)
     # --- reviewer_box (deaktiviert) ---
     # for se in seeds:
     #     df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=500, propagation_mode="reviewer_box", basket_alpha=0.5, seed=se,n_representatives=5)
