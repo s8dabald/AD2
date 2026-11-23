@@ -2,85 +2,51 @@ import os
 import time
 from datetime import datetime
 
+import numpy as np
+from openpyxl import Workbook, load_workbook
 from sklearn.metrics import roc_auc_score, precision_score, recall_score, confusion_matrix
 
 import logstore
 from dataprep import full_dataprep
-import numpy as np
-import pandas as pd
 from isolation_forest import run_if
-from models.kittyboost import train_catboost, compute_path_groups
-from querystep import uncertainty_query, novelty_scores
-from greedy import greedy_iteration, new_state, reviewer_rule_propagate, path_group_iteration
-from openpyxl import Workbook, load_workbook
+from models.kittyboost import train_catboost
+from querystep import novelty_scores, select_batch
+from propagation import (
+    FLAG_PREFIXES,
+    _adaptive_topk,
+    apply_shap_box_policy,
+    shap_box_selection,
+)
+from shap_box_policy import (
+    POLICY_SCHEMA_VERSION,
+    create_reviewer_shap_box_policy,
+    load_policy_replay,
+)
 
-_UNC_BUCKETS = [10, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
-
-
-def _path_groups_series(model, df):
-    """Path groups as Series posting_id -> group id (aligned to df rows)."""
-    return pd.Series(compute_path_groups(model, df), index=df["posting_id"].values)
-
-
-def _uncertainty_distribution(df, strategy, novelty_cache=None, buckets=_UNC_BUCKETS):
-    """Anteil Mispredicts in den Top-k der Uncertainty (alle Cases, kumulativ).
-
-    Reines Reporting (nutzt echte Labels) - beeinflusst nie Training/Selektion.
-    """
+def _uncertainty_values(df, strategy, novelty_cache=None):
     if strategy == "margin":
-        u = 1.0 - 2.0 * np.abs(df["pred_score"].values - 0.5)
+        return 1.0 - 2.0 * np.abs(df["pred_score"].values - 0.5)
     elif strategy == "entropy":
         p = np.clip(df["pred_score"].values, 1e-12, 1.0 - 1e-12)
-        u = -(p * np.log(p) + (1 - p) * np.log(1 - p)) / np.log(2)
+        return -(p * np.log(p) + (1 - p) * np.log(1 - p)) / np.log(2)
     elif strategy == "novelty":
         if novelty_cache is None:
             return None
-        u = np.asarray(novelty_cache)
+        return np.asarray(novelty_cache, dtype=float)
     else:
         return None
 
-    mis = df["label"].values.astype(int) != df["pred_label"].values.astype(int)
-    order = np.argsort(-u, kind="stable")
-    cum = np.cumsum(mis[order])
-    pop = len(mis)
-    counts = []
-    for k in buckets:
-        k = min(k, pop)
-        if k <= 0:
-            counts.append(0)
-        else:
-            counts.append(int(cum[k - 1]))
-    print("unc-dist: " + ", ".join(f"unc@{k}: {c}/{k}" for k, c in zip(buckets, counts)))
-    return {
-        "strategy": strategy,
-        "buckets": list(buckets),
-        "mispred_cum": counts,
-        "total_mispred": int(cum[-1]) if pop else 0,
-        "n_cases": int(pop),
-        "mean_uncertainty": float(u.mean()) if pop else 0.0,
-    }
-
-
-def _print_basket_summary(iteration, meta):
-    print(f"Baskets nach Iteration {iteration}:")
-    for basket in meta.get("baskets", []):
-        print(
-            f"  basket={basket['id']} oracle_id={basket['oracle_id']} "
-            f"name={basket['name'] or '-'} label={basket['label']} "
-            f"total={basket['total']} reviewed={basket['reviewed']} "
-            f"propagated={basket['propagated']}"
-        )
-
 
 def _drive_results_path():
-    """Drive-Pfad der Ergebnisdatei auf Colab, sonst None."""
+    """Return the Colab Drive path for the results workbook, if mounted."""
     if os.path.isdir("/content/drive/MyDrive"):
         return "/content/drive/MyDrive/test_results.xlsx"
     return None
 
+
 def test_logger(header, results):
     drive_path = _drive_results_path()
-    # Basis-Workbook: Drive (akkumuliert ueber mehrere Colab-Runs) > lokal > neu
+    #use drive workbook, then local workbook, then create new
     base = drive_path if (drive_path and os.path.exists(drive_path)) else None
     if base is None and os.path.exists("test_results.xlsx"):
         base = "test_results.xlsx"
@@ -94,7 +60,7 @@ def test_logger(header, results):
     ws.append([header])
     for result_str in results:
         ws.append([result_str])
-    ws.append(["'" + "=" * 80])  # separator line
+    ws.append(["'" + "=" * 80])  #separate runs
 
     for path in ["test_results.xlsx"] + ([drive_path] if drive_path else []):
         try:
@@ -106,620 +72,290 @@ def test_logger(header, results):
         except Exception as e:
             print("Failed to save", path, ":", e)
 
-def _compute_sample_weights(df, state, prop_weight_mode, corrected_weights):
-    """Per-case weights for distance-decayed propagation labels."""
-    if prop_weight_mode == "uniform" or state["nearest_dist"] is None:
-        return None
-    covered_mask = state["covered_arr"]
-    nearest_dist = state["nearest_dist"]
-    t = state["T"]
-    if prop_weight_mode == "linear_decay":
-        factors = np.maximum(0.0, 1.0 - nearest_dist / t)
-    elif prop_weight_mode == "gaussian_decay":
-        sigma = t / 2.0
-        factors = np.exp(-(nearest_dist ** 2) / (2 * sigma ** 2))
-    else:
-        factors = np.ones(len(df))
-    sample_weights = np.ones(len(df))
-    sample_weights[covered_mask] = corrected_weights * factors[covered_mask]
-    # Direct oracle corrections always get full weight
-    for pid in state["directly_corrected"]:
-        idx = np.where(state["X_ids"] == pid)[0][0]
-        sample_weights[idx] = corrected_weights
-    return sample_weights
 
-def _retrain_guard_ok(df, state, min_reviews=15):
-    """
-    Guard before retrain:
-    - at least min_reviews Prüfer-Korrekturen (directly_corrected) müssen existieren, und
-    - das Trainingsziel df["pred_label"] muss beide Klassen (0 und 1) enthalten,
-      damit CatBoost nicht mit "All train targets are equal" abstürzt.
-    """
-    # 1. Mind. min_reviews Prüfer-Korrekturen
-    reviewed = state.get("directly_corrected", state.get("corrected", []))
-    if len(reviewed) < min_reviews:
-        return False
-    # 2. Beide Klassen im Trainingsziel vorhanden?
-    if df["pred_label"].nunique() < 2:
-        return False
-    return True
-
-
-
-def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True, strategy="entropy",
-                     greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False,
+def retrain_catboost(df, l=10, corrected_weights=100, corrected_saved=True,
+                     strategy="margin", greedy_batching=False, greedy_T=None,
+                     compute_shap=False, skip_retrain_on_skip=False,
                      propagation_space=None, initial_shap=None, initial_model=None,
                      prop_weight_mode="uniform", selection_mode="uncertainty",
-                     early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2,
-                     seed=42, run=None, retrain_every=1,
-                      propagation_mode="auto_greedy", prop_k=2, prop_delta=0.25, feature_space="off",
-                      basket_alpha=0.5, n_representatives=3, rep_selection="farthest_point",
-                      fallback="family"):
-    if greedy_batching:
-        state = new_state(greedy_T, propagation_space=propagation_space, seed=seed)
-        if propagation_mode in ("label_consistent_baskets", "label_consistent_baskets_k"):
-            if retrain_every < 1:
-                raise ValueError("retrain_every must be at least 1")
-            state["review_phase_size"] = retrain_every
-        # Bootstrap SHAP from initial model so first iteration can use SHAP spaces
-        if initial_shap is not None:
-            state["shap_vals"] = initial_shap
-        if propagation_mode == "path_groups" and initial_model is not None:
-            state["path_groups"] = _path_groups_series(initial_model, df)
+                     early_stop=False, chunk_size=50, min_delta=0.001,
+                     stop_patience=2, seed=42, run=None, retrain_every=1,
+                     propagation_mode=None, prop_k=2, prop_delta=0.25,
+                     feature_space="off", basket_alpha=0.5,
+                     n_representatives=3, rep_selection="farthest_point",
+                     fallback="family", split_training=False,
+                     policy_mode=None, policy_replay=None,
+                     review_callback=None, phase_callback=None):
+    """Canonical CatBoost retrain loop, called by run_supervised."""
+    if propagation_mode not in (None, "shap_box_selection"):
+        raise ValueError(
+            f"Propagation mode {propagation_mode!r} lives in legacy/main.py"
+        )
+    tagged_selection = propagation_mode == "shap_box_selection"
+    compute_shap = tagged_selection or compute_shap
+    if tagged_selection and review_callback is not None:
+        policy_mode = "manual"
     else:
-        state = {"corrected": []}
+        policy_mode = (policy_mode or "discover") if tagged_selection else "none"
+    if retrain_every < 1:
+        raise ValueError("retrain_every must be at least 1")
+    df = df.reset_index(drop=True).copy()
+    df["posting_id"] = df["posting_id"].astype(str)
 
+    ids = df["posting_id"].astype(str).to_numpy()
+    id_to_row = {pid: row for row, pid in enumerate(ids)}
+    labels = df["label"].to_numpy(dtype=int)
+    true_by_id = dict(zip(ids, labels))
+    initial_targets = dict(zip(ids, df["pred_label"].to_numpy(dtype=int)))
+    tie_break = np.random.RandomState(seed).random_sample(len(df))
+    random_priority = np.random.RandomState(seed).random_sample(len(df))
+    initial_uncertainty = 1.0 - 2.0 * np.abs(df["pred_score"].to_numpy(dtype=float) - 0.5)
+
+    if split_training:
+        trusted_order = np.lexsort((tie_break, initial_uncertainty))
+        trusted_ids = set(ids[trusted_order[:round(0.5 * len(df))]])
+        trusted_targets = {pid: initial_targets[pid] for pid in trusted_ids}
+    else:
+        trusted_ids = set(ids)
+        trusted_targets = dict(initial_targets)
+
+    direct_targets = {}
+    reviewer_choices = {}
+    reviewed_ids = set()
+    propagated_targets = {}
+    pending_batch = []
+    current_batch = []
     novelty_cache = novelty_scores(df) if strategy == "novelty" else None
-
+    feature_names = [name for name in df.columns
+                     if name not in {"label", "posting_id", "pred_label", "pred_score"}]
+    raw_cols = [i for i, name in enumerate(feature_names)
+                if not name.startswith(FLAG_PREFIXES)]
+    raw_names = [feature_names[i] for i in raw_cols]
     results = []
-    target_iters = {1, l//2 + 1, l}
     cat_importances = None
     cat_model = None
     precision = recall = 0.0
     tn = fp = fn = tp = 0
     trees_this = 0
+    query_score = df["pred_score"].to_numpy(dtype=float).copy()
+    current_shap = initial_shap
+    final_flush_metrics = None
 
-    for i in range(l):
-        print(f"\n=== Iteration {i+1} ===")
-        t_iter = time.time()
+    def fit_current_targets():
+        fit_targets = dict(trusted_targets)
+        fit_targets.update(propagated_targets)
+        fit_targets.update(direct_targets)
+        fit_ids = set(fit_targets)
+        fitted = train_catboost(
+            df,
+            corrected_ids=set(direct_targets),
+            corrected_weights=corrected_weights,
+            compute_shap=tagged_selection or compute_shap,
+            early_stop=early_stop,
+            chunk_size=chunk_size,
+            min_delta=min_delta,
+            stop_patience=stop_patience,
+            seed=seed,
+            fit_ids=fit_ids,
+            fit_targets=fit_targets,
+        )
+        return fitted, fit_targets, fit_ids
 
-        t_q = time.time()
-        unc_rec = _uncertainty_distribution(df, strategy, novelty_cache)
-
-        if greedy_batching:
-            if propagation_mode == "shap_box":
-                df, state, meta = reviewer_rule_propagate(df, strategy, state, selection_mode=selection_mode,
-                                                          prop_k=prop_k, prop_delta=prop_delta,
-                                                          feature_space=feature_space)
-            elif propagation_mode == "shap_box_u":
-                df, state, meta = reviewer_rule_propagate(df, strategy, state, selection_mode=selection_mode,
-                                                          prop_k=prop_k, prop_delta=prop_delta,
-                                                          feature_space="off", case_delta_mode=True)
-            elif propagation_mode == "reviewer_box":
-                from greedy import reviewer_box_iteration
-                df, state, meta = reviewer_box_iteration(
-                    df, strategy, state, selection_mode=selection_mode,
-                    n_representatives=n_representatives, rep_selection=rep_selection,
-                    fallback=fallback, prop_delta=prop_delta)
-            elif propagation_mode == "cluster_baskets":
-                from greedy import cluster_baskets_iteration
-                df, state, meta = cluster_baskets_iteration(df, strategy, state, selection_mode=selection_mode,
-                                                            basket_alpha=basket_alpha)
-            elif propagation_mode == "cluster_baskets_oracle":
-                from greedy import cluster_baskets_oracle_iteration
-                df, state, meta = cluster_baskets_oracle_iteration(
-                    df, strategy, state, selection_mode=selection_mode,
-                    basket_alpha=basket_alpha)
-            elif propagation_mode == "cluster_baskets_direct":
-                from greedy import cluster_baskets_direct_iteration
-                df, state, meta = cluster_baskets_direct_iteration(df, state)
-            elif propagation_mode in ("label_consistent_baskets", "label_consistent_baskets_k"):
-                from greedy import label_consistent_basket_iteration
-                df, state, meta = label_consistent_basket_iteration(
-                    df, strategy, state, selection_mode=selection_mode,
-                    basket_alpha=basket_alpha,
-                    adaptive_topk=propagation_mode == "label_consistent_baskets_k")
-            elif propagation_mode == "path_groups":
-                df, state, meta = path_group_iteration(df, strategy, state, selection_mode=selection_mode)
+    for iteration in range(1, l + 1):
+        if not current_batch:
+            if strategy == "random":
+                priority = random_priority
             else:
-                df, state, meta = greedy_iteration(df, strategy, state, selection_mode=selection_mode)
-            if meta.get("type") == "no_candidates":
-                print("No more candidates in pool.")
-                break
-            if propagation_mode in ("cluster_baskets", "cluster_baskets_oracle", "cluster_baskets_direct", "label_consistent_baskets", "label_consistent_baskets_k"):
-                _print_basket_summary(i + 1, meta)
-            corrected_ids = list(state["directly_corrected"])
-            skip_retrain = skip_retrain_on_skip and meta.get("type") == "skip"
-        else:
-            uncertain_df = uncertainty_query(df, strategy, exclude_posting_ids=state["corrected"],
-                                             novelty_scores=novelty_cache)
-            meta = {}
-            mask = df['posting_id'].isin(uncertain_df['posting_id'])
-            meta["misspredicted"] = (df.loc[mask, 'label'] != df.loc[mask, 'pred_label']).sum()
-            df.loc[mask, 'pred_label'] = df.loc[mask, 'label']
-            if corrected_saved:
-                state["corrected"].extend(uncertain_df['posting_id'].tolist())
-            corrected_ids = state["corrected"]
-            skip_retrain = False
-        query_s = time.time() - t_q
-
-        if propagation_mode in ("label_consistent_baskets", "label_consistent_baskets_k"):
-            should_retrain = meta.get("force_retrain", False)
-        else:
-            should_retrain = (
-                propagation_mode == "cluster_baskets_direct"
-                or meta.get("force_retrain", False)
-                or ((i + 1) % retrain_every == 0 and not skip_retrain
-                    and _retrain_guard_ok(df, state, min_reviews=15))
+                priority = _uncertainty_values(df, strategy, novelty_cache)
+                if priority is None:
+                    raise ValueError(f"Unsupported strategy for batch workflow: {strategy}")
+            current_batch = select_batch(
+                df,
+                trusted_ids if split_training else set(),
+                reviewed_ids,
+                priority,
+                tie_break,
+                min(retrain_every, l - iteration + 1),
             )
-        if not should_retrain:
-            y_true_eval = df["label"].astype(int)
-            y_pred_eval = df["pred_label"].astype(int)
-            precision = precision_score(y_true_eval, y_pred_eval, zero_division=0)
-            recall = recall_score(y_true_eval, y_pred_eval, zero_division=0)
-            tn, fp, fn, tp = confusion_matrix(y_true_eval, y_pred_eval, labels=[0, 1]).ravel()
-            if skip_retrain:
-                print(f"Skip-Retrain (keine Labeländerung) | "
-                      f"Precision: {precision:.4f}, Recall: {recall:.4f}, Trees: {trees_this}"
-                      f", dur {time.time()-t_iter:.1f}s (query {query_s:.1f}s, train 0.0s)")
+        posting_id = current_batch.pop(0)
+        reviewed_ids.add(posting_id)
+        if review_callback is None:
+            direct_label = int(true_by_id[posting_id])
+        else:
+            row_idx = id_to_row[posting_id]
+            shap_row = (
+                np.asarray(current_shap[row_idx, raw_cols], dtype=float)
+                if current_shap is not None else np.zeros(len(raw_names), dtype=float)
+            )
+            score = float(df.loc[row_idx, "pred_score"])
+            adaptive_k, adaptive_positions = _adaptive_topk(shap_row, score)
+            review_decision = review_callback({
+                "posting_id": posting_id,
+                "iteration": iteration,
+                "review_count": iteration - 1,
+                "review_target": retrain_every,
+                "total_reviews": l,
+                "model_probability": score,
+                "predicted_label": int(df.loc[row_idx, "pred_label"]),
+                "uncertainty": float(1.0 - 2.0 * abs(score - 0.5)),
+                "shap": [
+                    {"feature": feature, "value": float(value)}
+                    for feature, value in zip(raw_names, shap_row)
+                ],
+                "adaptive_k": adaptive_k,
+                "adaptive_features": [raw_names[int(pos)] for pos in adaptive_positions],
+            })
+            if not isinstance(review_decision, dict) or "label" not in review_decision:
+                raise ValueError("review_callback must return dict with label")
+            label_value = review_decision["label"]
+            if isinstance(label_value, str):
+                normalized = label_value.strip().lower()
+                if normalized not in {"normal", "anomaly"}:
+                    raise ValueError(f"Unsupported reviewer label: {label_value!r}")
+                direct_label = int(normalized == "anomaly")
             else:
-                next_retrain = ((i + 1) // retrain_every + 1) * retrain_every
-                print(f"LAZY (kein Retrain, nächster @ Iter {next_retrain}) | "
-                      f"Precision: {precision:.4f}, Recall: {recall:.4f}, Trees: {trees_this}"
-                      f", dur {time.time()-t_iter:.1f}s (query {query_s:.1f}s, train 0.0s)")
-            train_s = 0.0
-            es = None
-        else:
-            sample_weights = _compute_sample_weights(df, state, prop_weight_mode, corrected_weights) if greedy_batching else None
+                direct_label = int(label_value)
+            if direct_label not in (0, 1):
+                raise ValueError(f"Reviewer label must be 0/1, got {label_value!r}")
+            reviewer_choices[posting_id] = review_decision.get("feature_choices", {})
 
-            t_tr = time.time()
-            df, cat_importances, precision, recall, cat_model, tn, fp, fn, tp, shap_vals, es = train_catboost(
-                df, corrected_ids=corrected_ids, corrected_weights=corrected_weights,
-                sample_weights=sample_weights, compute_shap=compute_shap,
-                early_stop=early_stop, chunk_size=chunk_size, min_delta=min_delta,
-                stop_patience=stop_patience, seed=seed
-            )
-            train_s = time.time() - t_tr
-            trees_this = cat_model.tree_count_
-            # Store SHAP in state so greedy propagation can use it
-            if greedy_batching:
-                state["shap_vals"] = shap_vals
-            if greedy_batching and propagation_mode == "path_groups":
-                state["path_groups"] = _path_groups_series(cat_model, df)
-            print(f"Precision: {precision:.4f}, Recall: {recall:.4f}, Trees (this iter): {trees_this}"
-                  f", dur {time.time()-t_iter:.1f}s (query {query_s:.1f}s, train {train_s:.1f}s)")
-            if greedy_batching:
-                if propagation_mode in ("shap_box", "shap_box_u", "reviewer_box"):
-                    r = meta.get("rule") or {}
-                    band_str = ", ".join(f"{f} ∈ [{lo:.4f},{hi:.4f}]" for f, (lo, hi)
-                                         in zip(r.get("features", []), r.get("bands", [])))
-                    prop_acc = meta.get("propagation_accuracy")
-                    prop_acc_str = f"{prop_acc:.4f}" if prop_acc is not None else "N/A"
-                    fs = feature_space if propagation_mode in ("shap_box", "shap_box_u") else "reviewer"
-                    extra = ""
-                    if propagation_mode == "reviewer_box":
-                        extra = (f", reps={meta.get('n_representatives')} "
-                                 f"(acc={meta.get('n_accepted')}/rej={meta.get('n_rejected')}), "
-                                 f"rule_feats={meta.get('n_rule_features')}, "
-                                 f"fallback={meta.get('fallback_used')}")
-                    elif propagation_mode == "shap_box_u":
-                        dc = meta.get("delta_covered") or {}
-                        extra += (f", delta_seed={meta.get('delta_seed', 0.0):.3f}, "
-                                  f"delta_cov=[{dc.get('min', 0.0):.3f},"
-                                  f"{dc.get('median', 0.0):.3f},"
-                                  f"{dc.get('max', 0.0):.3f}], "
-                                  f"u_seed={meta.get('M_uncertainty', 0.0):.3f}, "
-                                  f"u_rank_seed={meta.get('M_uncertainty_rank') or 0.0:.3f}, "
-                                  f"changed_ok={meta.get('n_changed_correct', 0)}, "
-                                  f"changed_wrong={meta.get('n_changed_wrong', 0)}")
-                    print(f"REVIEWER-RULE ({meta.get('type')}): {band_str} → {meta.get('n_covered')} Cases "
-                          f"(acc={prop_acc_str}, flipped={meta.get('n_flipped')}, "
-                          f"fs={fs}, family={meta.get('rule', {}).get('family_size')}{extra})")
-                elif propagation_mode == "path_groups":
-                    print(f"PATH-GROUP ({meta.get('type')}): group_size={meta.get('group_size')}, "
-                          f"covered={meta.get('n_covered')}, flipped={meta.get('n_flipped')}, "
-                          f"acc={meta.get('propagation_accuracy')}, mixed={meta.get('n_mixed')}, "
-                          f"cum_direct={meta.get('cumulative_direct')}")
+        direct_targets[posting_id] = direct_label
+        propagated_targets.pop(posting_id, None)
+        pending_batch.append(posting_id)
+        df.loc[df["posting_id"].astype(str) == posting_id, "pred_label"] = direct_targets[posting_id]
+
+        batch_end = iteration % retrain_every == 0 or iteration == l
+        if not batch_end:
+            y_true = df["label"].astype(int)
+            y_pred = df["pred_label"].astype(int)
+            precision = precision_score(y_true, y_pred, zero_division=0)
+            recall = recall_score(y_true, y_pred, zero_division=0)
+            tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+            if run is not None:
+                run.write("iter", run_id=run.run_id, iteration=iteration,
+                          mode="batch_review", strategy=strategy,
+                          reviewed_id=posting_id, precision=precision, recall=recall)
+            continue
+
+        t_fit = time.time()
+        if phase_callback is not None:
+            phase_callback("retrain", iteration, l, retrain_every)
+        fitted, fit_targets, fit_ids = fit_current_targets()
+        (df, cat_importances, precision, recall, cat_model,
+         tn, fp, fn, tp, shap_vals, early_stop_info) = fitted
+        trees_this = cat_model.tree_count_
+        query_score = df["pred_score"].to_numpy(dtype=float).copy()
+        current_shap = shap_vals
+        fit_metrics = _fit_target_agreement(
+            df["pred_label"].to_numpy(dtype=int), query_score, ids,
+            trusted_targets, direct_targets, propagated_targets,
+        )
+
+        new_targets = set()
+        candidate_count = fit_blocked = conflicts = 0
+        if tagged_selection:
+            shap_all = np.asarray(shap_vals, dtype=float)
+            shap_raw = shap_all[:, raw_cols]
+            propagation_fit_ids = (trusted_ids if split_training else set()) | set(direct_targets) | set(propagated_targets)
+            queued_targets = dict(propagated_targets)
+            for rank, seed_id in enumerate(pending_batch, start=1):
+                seed_row = id_to_row[seed_id]
+                if policy_mode == "manual":
+                    policy = create_reviewer_shap_box_policy(
+                        shap_raw, raw_names, query_score, seed_row,
+                        reviewer_choices.pop(seed_id, {}),
+                    )
+                    mask = apply_shap_box_policy(
+                        shap_raw, raw_names, seed_row, policy
+                    )
+                elif policy_mode == "discover":
+                    mask, policy = shap_box_selection(
+                        shap_raw, raw_names, query_score, seed_row,
+                        direct_targets[seed_id], labels,
+                    )
+                elif policy_mode == "replay":
+                    policy = policy_replay.policy_for(seed_id)
+                    mask = apply_shap_box_policy(shap_raw, raw_names, seed_row, policy)
                 else:
-                    print(f"type={meta.get('type')}, centers={meta.get('n_centers')}, "
-                          f"covered={meta.get('n_covered')}, flipped={meta.get('n_flipped')}, "
-                          f"prop_dims={meta.get('prop_dims')}, "
-                          f"M_density={meta.get('M_density', 0):.0f}")
-            else:
-                print(f"Misspredicted: {meta.get('misspredicted')}")
+                    raise ValueError(f"Unsupported tagged policy mode: {policy_mode!r}")
+                matched = set(ids[mask])
+                blocked = matched & propagation_fit_ids
+                eligible = matched - propagation_fit_ids
+                recipients = sorted(eligible - set(queued_targets), key=id_to_row.get)
+                candidate_count += len(matched)
+                fit_blocked += len(blocked)
+                conflicts += len(eligible & set(queued_targets))
+                for recipient in recipients:
+                    queued_targets[recipient] = direct_targets[seed_id]
+                    new_targets.add(recipient)
+                if run is not None:
+                    run.write("policy", run_id=run.run_id, seed_id=seed_id,
+                              review_budget=iteration - len(pending_batch) + rank,
+                              policy_schema_version=POLICY_SCHEMA_VERSION,
+                              policy_source=(
+                                  "reviewer" if policy_mode == "manual"
+                                  else "replay" if policy_mode == "replay"
+                                  else "automatic_discovery"
+                              ),
+                              policy_source_run_id=(
+                                  policy_replay.source_run_id if policy_replay is not None else None
+                              ),
+                              policy=policy, candidate_matches=len(matched),
+                              fit_blocked=len(blocked), new_propagated=len(recipients),
+                              propagation_events=[{
+                                  "posting_id": recipient,
+                                  "propagated_label": direct_targets[seed_id],
+                                  "true_label": true_by_id[recipient],
+                                  "seed_posting_id": seed_id,
+                              } for recipient in recipients])
+            propagated_targets = queued_targets
+
+        checkpoint = {
+            "round": (iteration - 1) // retrain_every + 1,
+            "review_budget": iteration,
+            "reviewed_ids": list(pending_batch),
+            "metrics": {"precision": precision, "recall": recall,
+                        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
+            "fit_target_metrics": fit_metrics,
+            "fit_rows": len(fit_ids),
+            "new_propagated": len(new_targets),
+            "active_propagated": len(propagated_targets),
+            "candidate_matches": candidate_count,
+            "fit_blocked": fit_blocked,
+            "overlap_conflicts": conflicts,
+            "fit_seconds": time.time() - t_fit,
+        }
+
+        #fit recipients queued by final batch
+        if iteration == l:
+            t_flush = time.time()
+            final_fit, _final_targets, final_fit_ids = fit_current_targets()
+            (df, cat_importances, precision, recall, cat_model,
+             tn, fp, fn, tp, _final_shap, early_stop_info) = final_fit
+            final_flush_metrics = {
+                "precision": precision, "recall": recall,
+                "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+                "fit_rows": len(final_fit_ids),
+                "fit_seconds": time.time() - t_flush,
+            }
+            checkpoint["final_flush"] = final_flush_metrics
 
         if run is not None:
-            try:
-                auc_val = float(roc_auc_score(df["label"].astype(int), df["pred_score"]))
-            except ValueError:
-                auc_val = None
-            if greedy_batching:
-                greedy_meta = {
-                    "type": meta.get("type"), "n_centers": meta.get("n_centers"),
-                    "n_covered": meta.get("n_covered"), "cumulative_direct": meta.get("cumulative_direct"),
-                    "n_flipped": meta.get("n_flipped"), "propagation_accuracy": meta.get("propagation_accuracy"),
-                    "prop_dims": meta.get("prop_dims"), "M_density": meta.get("M_density"),
-                    "T": state.get("T"), "selection_mode": selection_mode,
-                    "rule": meta.get("rule"), "propagation_mode": propagation_mode,
-                    "M_pred_score": meta.get("M_pred_score"), "M_pred_label": meta.get("M_pred_label"),
-                    "M_uncertainty": meta.get("M_uncertainty"),
-                    "delta_seed": meta.get("delta_seed"),
-                    "delta_covered": meta.get("delta_covered"),
-                    "covered_u": meta.get("covered_u"),
-                    "value_bands": meta.get("value_bands"),
-                    "fallback_used": meta.get("fallback_used"),
-                    "n_representatives": meta.get("n_representatives"),
-                    "n_accepted": meta.get("n_accepted"), "n_rejected": meta.get("n_rejected"),
-                    "n_rule_features": meta.get("n_rule_features"),
-                    "reviewer_rule": meta.get("reviewer_rule"),
-                    "topk_k": meta.get("topk_k"),
-                    "topk_features": meta.get("topk_features"),
-                    "topk_fallback": meta.get("topk_fallback"),
-                    "group_size": meta.get("group_size"),
-                    "n_mixed": meta.get("n_mixed"),
-                }
-                corrected_so_far = meta.get("cumulative_direct")
-            else:
-                greedy_meta = None
-                corrected_so_far = len(state["corrected"])
-            run.write("iter", run_id=run.run_id,
-                      iteration=i + 1,
-                      mode="skip" if skip_retrain else ("lazy" if not should_retrain else "retrain"),
-                      precision=precision, recall=recall,
-                      trees_this=trees_this,
-                      model_trees=cat_model.tree_count_ if cat_model is not None else None,
-                      tn=tn, fp=fp, fn=fn, tp=tp, auc=auc_val,
-                      misspredicted=meta.get("misspredicted") if not greedy_batching else None,
-                      corrected_so_far=corrected_so_far,
-                      query_s=query_s, train_s=train_s, dur_s=time.time()-t_iter,
-                      uncertainty=unc_rec, greedy=greedy_meta,
-                      early_stop=es)
-            if es is not None:
-                for c in es.get("chunk_curve", []):
-                    run.write("chunk", run_id=run.run_id, iteration=i + 1, **c)
+            run.write("iter", run_id=run.run_id, iteration=iteration,
+                      mode="retrain", strategy=strategy,
+                      propagation_mode="shap_box_selection" if tagged_selection else None,
+                      split_training=split_training, **checkpoint)
+        results.append(
+            f"Iteration: {iteration}, Precision: {precision:.4f}, Recall: {recall:.4f}, "
+            f"Reviews: {len(direct_targets)}, Fit rows: {len(fit_ids)}, "
+            f"Propagated: {len(new_targets)}"
+        )
+        pending_batch = []
 
-        if (i+1) in target_iters:
-            base = (f"Iteration: {i+1}, Precision: {precision:.4f}, Recall: {recall:.4f}, Trees: {trees_this}, "
-                    f"TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
-            if skip_retrain:
-                extra = ", type=skip (retrain skipped)"
-            elif greedy_batching and propagation_mode in ("shap_box", "shap_box_u", "reviewer_box"):
-                r = meta.get("rule") or {}
-                band_str = ", ".join(f"{f}∈[{lo:.4f},{hi:.4f}]" for f, (lo, hi)
-                                     in zip(r.get("features", []), r.get("bands", [])))
-                prop_acc = meta.get("propagation_accuracy")
-                prop_acc_str = f"{prop_acc:.4f}" if prop_acc is not None else "N/A"
-                extra = (f", type={meta.get('type')}, rule=[{band_str}], covered={meta.get('n_covered')}, "
-                         f"flipped={meta.get('n_flipped')}, prop_acc={prop_acc_str}")
-                if propagation_mode == "reviewer_box":
-                    extra += (f", reps={meta.get('n_representatives')} "
-                              f"(acc={meta.get('n_accepted')}/rej={meta.get('n_rejected')}), "
-                              f"rule_feats={meta.get('n_rule_features')}, "
-                              f"fallback={meta.get('fallback_used')}")
-                elif propagation_mode == "shap_box_u":
-                    dc = meta.get("delta_covered") or {}
-                    extra += (f", delta_seed={meta.get('delta_seed', 0.0):.3f}, "
-                              f"delta_cov=[{dc.get('min', 0.0):.3f},"
-                              f"{dc.get('median', 0.0):.3f},"
-                              f"{dc.get('max', 0.0):.3f}], "
-                              f"u_seed={meta.get('M_uncertainty', 0.0):.3f}, "
-                              f"u_rank_seed={meta.get('M_uncertainty_rank') or 0.0:.3f}, "
-                              f"changed_ok={meta.get('n_changed_correct', 0)}, "
-                              f"changed_wrong={meta.get('n_changed_wrong', 0)}")
-            elif greedy_batching and propagation_mode == "path_groups":
-                prop_acc = meta.get("propagation_accuracy")
-                prop_acc_str = f"{prop_acc:.4f}" if prop_acc is not None else "N/A"
-                extra = (f", type={meta.get('type')}, group_size={meta.get('group_size')}, "
-                         f"covered={meta.get('n_covered')}, flipped={meta.get('n_flipped')}, "
-                         f"prop_acc={prop_acc_str}, mixed={meta.get('n_mixed')}, "
-                         f"cum_direct={meta.get('cumulative_direct')}, "
-                         f"weight_mode={prop_weight_mode}, sel_mode={selection_mode}")
-            elif greedy_batching:
-                prop_acc = meta.get("propagation_accuracy")
-                prop_acc_str = f"{prop_acc:.4f}" if prop_acc is not None else "N/A"
-                extra = (f", type={meta.get('type')}, centers={meta.get('n_centers')}, "
-                         f"covered={meta.get('n_covered')}, cum_direct={meta.get('cumulative_direct')}, "
-                         f"flipped={meta.get('n_flipped')}, prop_acc={prop_acc_str}, "
-                         f"T={state['T']:.4f}, prop_dims={meta.get('prop_dims')}, "
-                         f"weight_mode={prop_weight_mode}, sel_mode={selection_mode}")
-            else:
-                extra = f", Misspredicted: {meta.get('misspredicted')}"
-            results.append(base + extra)
-
-    return df, cat_importances, precision, recall, results
-
-def incremental_catboost(df, l=10, corrected_weights=100, corrected_saved=True, strategy="entropy",
-                         greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False,
-                         propagation_space=None, initial_shap=None, initial_model=None,
-                         prop_weight_mode="uniform", selection_mode="uncertainty",
-                         early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2,
-                         seed=42, run=None, retrain_every=1,
-                         propagation_mode="auto_greedy", prop_k=2, prop_delta=0.25, feature_space="off",
-                         basket_alpha=0.5, n_representatives=3, rep_selection="farthest_point",
-                         fallback="family"):
-    """Like retrain_catboost, but continues the previous model via init_model
-    instead of a full 500-tree retrain (warm start)."""
-    if greedy_batching:
-        state = new_state(greedy_T, propagation_space=propagation_space, seed=seed)
-        if propagation_mode in ("label_consistent_baskets", "label_consistent_baskets_k"):
-            if retrain_every < 1:
-                raise ValueError("retrain_every must be at least 1")
-            state["review_phase_size"] = retrain_every
-        # Bootstrap SHAP from initial model so first iteration can use SHAP spaces
-        if initial_shap is not None:
-            state["shap_vals"] = initial_shap
-        if propagation_mode == "path_groups" and initial_model is not None:
-            state["path_groups"] = _path_groups_series(initial_model, df)
-    else:
-        state = {"corrected": []}
-
-    novelty_cache = novelty_scores(df) if strategy == "novelty" else None
-
-    results = []
-    target_iters = {1, l//2 + 1, l}
-    cat_importances = None
-    cat_model = None
-    precision = recall = 0.0
-    tn = fp = fn = tp = 0
-    prev_trees = 0
-    trees_this = 0
-
-    for i in range(l):
-        print(f"\n=== Incremental Iteration {i+1} ===")
-        t_iter = time.time()
-
-        t_q = time.time()
-        unc_rec = _uncertainty_distribution(df, strategy, novelty_cache)
-
-        if greedy_batching:
-            if propagation_mode == "shap_box":
-                df, state, meta = reviewer_rule_propagate(df, strategy, state, selection_mode=selection_mode,
-                                                          prop_k=prop_k, prop_delta=prop_delta,
-                                                          feature_space=feature_space)
-            elif propagation_mode == "shap_box_u":
-                df, state, meta = reviewer_rule_propagate(df, strategy, state, selection_mode=selection_mode,
-                                                          prop_k=prop_k, prop_delta=prop_delta,
-                                                          feature_space="off", case_delta_mode=True)
-            elif propagation_mode == "reviewer_box":
-                from greedy import reviewer_box_iteration
-                df, state, meta = reviewer_box_iteration(
-                    df, strategy, state, selection_mode=selection_mode,
-                    n_representatives=n_representatives, rep_selection=rep_selection,
-                    fallback=fallback, prop_delta=prop_delta)
-            elif propagation_mode == "cluster_baskets":
-                from greedy import cluster_baskets_iteration
-                df, state, meta = cluster_baskets_iteration(df, strategy, state, selection_mode=selection_mode,
-                                                            basket_alpha=basket_alpha)
-            elif propagation_mode == "cluster_baskets_oracle":
-                from greedy import cluster_baskets_oracle_iteration
-                df, state, meta = cluster_baskets_oracle_iteration(
-                    df, strategy, state, selection_mode=selection_mode,
-                    basket_alpha=basket_alpha)
-            elif propagation_mode == "cluster_baskets_direct":
-                from greedy import cluster_baskets_direct_iteration
-                df, state, meta = cluster_baskets_direct_iteration(df, state)
-            elif propagation_mode in ("label_consistent_baskets", "label_consistent_baskets_k"):
-                from greedy import label_consistent_basket_iteration
-                df, state, meta = label_consistent_basket_iteration(
-                    df, strategy, state, selection_mode=selection_mode,
-                    basket_alpha=basket_alpha,
-                    adaptive_topk=propagation_mode == "label_consistent_baskets_k")
-            elif propagation_mode == "path_groups":
-                df, state, meta = path_group_iteration(df, strategy, state, selection_mode=selection_mode)
-            else:
-                df, state, meta = greedy_iteration(df, strategy, state, selection_mode=selection_mode)
-            if meta.get("type") == "no_candidates":
-                print("No more candidates in pool.")
-                break
-            if propagation_mode in ("cluster_baskets", "cluster_baskets_oracle", "cluster_baskets_direct", "label_consistent_baskets", "label_consistent_baskets_k"):
-                _print_basket_summary(i + 1, meta)
-            corrected_ids = list(state["directly_corrected"])
-            skip_retrain = skip_retrain_on_skip and meta.get("type") == "skip"
-        else:
-            uncertain_df = uncertainty_query(df, strategy, exclude_posting_ids=state["corrected"],
-                                             novelty_scores=novelty_cache)
-            meta = {}
-            mask = df['posting_id'].isin(uncertain_df['posting_id'])
-            meta["misspredicted"] = (df.loc[mask, 'label'] != df.loc[mask, 'pred_label']).sum()
-            df.loc[mask, 'pred_label'] = df.loc[mask, 'label']
-            if corrected_saved:
-                state["corrected"].extend(uncertain_df['posting_id'].tolist())
-            corrected_ids = state["corrected"]
-            skip_retrain = False
-        query_s = time.time() - t_q
-
-        if propagation_mode in ("label_consistent_baskets", "label_consistent_baskets_k"):
-            should_retrain = meta.get("force_retrain", False)
-        else:
-            should_retrain = (
-                propagation_mode == "cluster_baskets_direct"
-                or meta.get("force_retrain", False)
-                or ((i + 1) % retrain_every == 0 and not skip_retrain
-                    and _retrain_guard_ok(df, state, min_reviews=15))
-            )
-        if not should_retrain:
-            y_true_eval = df["label"].astype(int)
-            y_pred_eval = df["pred_label"].astype(int)
-            precision = precision_score(y_true_eval, y_pred_eval, zero_division=0)
-            recall = recall_score(y_true_eval, y_pred_eval, zero_division=0)
-            tn, fp, fn, tp = confusion_matrix(y_true_eval, y_pred_eval, labels=[0, 1]).ravel()
-            if skip_retrain:
-                print(f"Skip-Retrain (keine Labeländerung) | "
-                      f"Precision: {precision:.4f}, Recall: {recall:.4f}, Trees: {trees_this}"
-                      f", dur {time.time()-t_iter:.1f}s (query {query_s:.1f}s, train 0.0s)")
-            else:
-                next_retrain = ((i + 1) // retrain_every + 1) * retrain_every
-                print(f"LAZY (kein Retrain, nächster @ Iter {next_retrain}) | "
-                      f"Precision: {precision:.4f}, Recall: {recall:.4f}, Trees: {trees_this}"
-                      f", dur {time.time()-t_iter:.1f}s (query {query_s:.1f}s, train 0.0s)")
-            train_s = 0.0
-            es = None
-        else:
-            sample_weights = _compute_sample_weights(df, state, prop_weight_mode, corrected_weights) if greedy_batching else None
-
-            if cat_model is not None:
-                prev_trees = cat_model.tree_count_
-            t_tr = time.time()
-            df, cat_importances, precision, recall, cat_model, tn, fp, fn, tp, shap_vals, es = train_catboost(
-                df, incremental=True, inc_model=cat_model, full_data=df,
-                corrected_ids=corrected_ids, corrected_weights=corrected_weights,
-                sample_weights=sample_weights, compute_shap=compute_shap,
-                early_stop=early_stop, chunk_size=chunk_size, min_delta=min_delta,
-                stop_patience=stop_patience, seed=seed
-            )
-            train_s = time.time() - t_tr
-            trees_this = cat_model.tree_count_ - prev_trees
-            # Store SHAP in state so greedy propagation can use it
-            if greedy_batching:
-                state["shap_vals"] = shap_vals
-            if greedy_batching and propagation_mode == "path_groups":
-                state["path_groups"] = _path_groups_series(cat_model, df)
-            print(f"Precision: {precision:.4f}, Recall: {recall:.4f}, Trees (this iter): {trees_this}"
-                  f", dur {time.time()-t_iter:.1f}s (query {query_s:.1f}s, train {train_s:.1f}s)")
-            if greedy_batching:
-                if propagation_mode in ("shap_box", "shap_box_u", "reviewer_box"):
-                    r = meta.get("rule") or {}
-                    band_str = ", ".join(f"{f} ∈ [{lo:.4f},{hi:.4f}]" for f, (lo, hi)
-                                         in zip(r.get("features", []), r.get("bands", [])))
-                    prop_acc = meta.get("propagation_accuracy")
-                    prop_acc_str = f"{prop_acc:.4f}" if prop_acc is not None else "N/A"
-                    fs = feature_space if propagation_mode in ("shap_box", "shap_box_u") else "reviewer"
-                    extra = ""
-                    if propagation_mode == "reviewer_box":
-                        extra = (f", reps={meta.get('n_representatives')} "
-                                 f"(acc={meta.get('n_accepted')}/rej={meta.get('n_rejected')}), "
-                                 f"rule_feats={meta.get('n_rule_features')}, "
-                                 f"fallback={meta.get('fallback_used')}")
-                    elif propagation_mode == "shap_box_u":
-                        dc = meta.get("delta_covered") or {}
-                        extra += (f", delta_seed={meta.get('delta_seed', 0.0):.3f}, "
-                                  f"delta_cov=[{dc.get('min', 0.0):.3f},"
-                                  f"{dc.get('median', 0.0):.3f},"
-                                  f"{dc.get('max', 0.0):.3f}], "
-                                  f"u_seed={meta.get('M_uncertainty', 0.0):.3f}, "
-                                  f"u_rank_seed={meta.get('M_uncertainty_rank') or 0.0:.3f}, "
-                                  f"changed_ok={meta.get('n_changed_correct', 0)}, "
-                                  f"changed_wrong={meta.get('n_changed_wrong', 0)}")
-                    print(f"REVIEWER-RULE ({meta.get('type')}): {band_str} → {meta.get('n_covered')} Cases "
-                          f"(acc={prop_acc_str}, flipped={meta.get('n_flipped')}, "
-                          f"fs={fs}, family={meta.get('rule', {}).get('family_size')}{extra})")
-                elif propagation_mode == "path_groups":
-                    print(f"PATH-GROUP ({meta.get('type')}): group_size={meta.get('group_size')}, "
-                          f"covered={meta.get('n_covered')}, flipped={meta.get('n_flipped')}, "
-                          f"acc={meta.get('propagation_accuracy')}, mixed={meta.get('n_mixed')}, "
-                          f"cum_direct={meta.get('cumulative_direct')}")
-                else:
-                    print(f"type={meta.get('type')}, centers={meta.get('n_centers')}, "
-                          f"covered={meta.get('n_covered')}, flipped={meta.get('n_flipped')}, "
-                          f"prop_dims={meta.get('prop_dims')}, "
-                          f"M_density={meta.get('M_density', 0):.0f}")
-            else:
-                print(f"Misspredicted: {meta.get('misspredicted')}")
-
-        if run is not None:
-            try:
-                auc_val = float(roc_auc_score(df["label"].astype(int), df["pred_score"]))
-            except ValueError:
-                auc_val = None
-            if greedy_batching:
-                greedy_meta = {
-                    "type": meta.get("type"), "n_centers": meta.get("n_centers"),
-                    "n_covered": meta.get("n_covered"), "cumulative_direct": meta.get("cumulative_direct"),
-                    "n_flipped": meta.get("n_flipped"), "propagation_accuracy": meta.get("propagation_accuracy"),
-                    "prop_dims": meta.get("prop_dims"), "M_density": meta.get("M_density"),
-                    "T": state.get("T"), "selection_mode": selection_mode,
-                    "rule": meta.get("rule"), "propagation_mode": propagation_mode,
-                    "M_pred_score": meta.get("M_pred_score"), "M_pred_label": meta.get("M_pred_label"),
-                    "M_uncertainty": meta.get("M_uncertainty"),
-                    "delta_seed": meta.get("delta_seed"),
-                    "delta_covered": meta.get("delta_covered"),
-                    "covered_u": meta.get("covered_u"),
-                    "value_bands": meta.get("value_bands"),
-                    "fallback_used": meta.get("fallback_used"),
-                    "n_representatives": meta.get("n_representatives"),
-                    "n_accepted": meta.get("n_accepted"), "n_rejected": meta.get("n_rejected"),
-                    "n_rule_features": meta.get("n_rule_features"),
-                    "reviewer_rule": meta.get("reviewer_rule"),
-                    "topk_k": meta.get("topk_k"),
-                    "topk_features": meta.get("topk_features"),
-                    "topk_fallback": meta.get("topk_fallback"),
-                    "group_size": meta.get("group_size"),
-                    "n_mixed": meta.get("n_mixed"),
-                }
-                corrected_so_far = meta.get("cumulative_direct")
-            else:
-                greedy_meta = None
-                corrected_so_far = len(state["corrected"])
-            run.write("iter", run_id=run.run_id,
-                      iteration=i + 1,
-                      mode="skip" if skip_retrain else ("lazy" if not should_retrain else "incremental"),
-                      precision=precision, recall=recall,
-                      trees_this=trees_this,
-                      model_trees=cat_model.tree_count_ if cat_model is not None else None,
-                      tn=tn, fp=fp, fn=fn, tp=tp, auc=auc_val,
-                      misspredicted=meta.get("misspredicted") if not greedy_batching else None,
-                      corrected_so_far=corrected_so_far,
-                      query_s=query_s, train_s=train_s, dur_s=time.time()-t_iter,
-                      uncertainty=unc_rec, greedy=greedy_meta,
-                      early_stop=es)
-            if es is not None:
-                for c in es.get("chunk_curve", []):
-                    run.write("chunk", run_id=run.run_id, iteration=i + 1, **c)
-
-        if (i+1) in target_iters:
-            base = (f"Iteration: {i+1}, Precision: {precision:.4f}, Recall: {recall:.4f}, Trees: {trees_this}, "
-                    f"TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
-            if skip_retrain:
-
-                extra = ", type=skip (retrain skipped)"
-
-            elif greedy_batching and propagation_mode == "shap_box":
-
-                r = meta.get("rule") or {}
-                band_str = ", ".join(
-                    f"{f}∈[{lo:.4f},{hi:.4f}]"
-                    for f, (lo, hi) in zip(r.get("features", []), r.get("bands", []))
-                )
-
-                prop_acc = meta.get("propagation_accuracy")
-                prop_acc_str = f"{prop_acc:.4f}" if prop_acc is not None else "N/A"
-
-                extra = (
-                    f", type={meta.get('type')}, rule=[{band_str}], "
-                    f"covered={meta.get('n_covered')}, "
-                    f"flipped={meta.get('n_flipped')}, "
-                    f"prop_acc={prop_acc_str}"
-                )
-
-            elif greedy_batching and propagation_mode == "path_groups":
-                prop_acc = meta.get("propagation_accuracy")
-                prop_acc_str = f"{prop_acc:.4f}" if prop_acc is not None else "N/A"
-                extra = (f", type={meta.get('type')}, group_size={meta.get('group_size')}, "
-                         f"covered={meta.get('n_covered')}, flipped={meta.get('n_flipped')}, "
-                         f"prop_acc={prop_acc_str}, mixed={meta.get('n_mixed')}, "
-                         f"cum_direct={meta.get('cumulative_direct')}, "
-                         f"weight_mode={prop_weight_mode}, sel_mode={selection_mode}")
-            elif greedy_batching:
-
-                prop_acc = meta.get("propagation_accuracy")
-                prop_acc_str = f"{prop_acc:.4f}" if prop_acc is not None else "N/A"
-
-                extra = (
-                    f", type={meta.get('type')}, centers={meta.get('n_centers')}, "
-                    f"covered={meta.get('n_covered')}, cum_direct={meta.get('cumulative_direct')}, "
-                    f"flipped={meta.get('n_flipped')}, prop_acc={prop_acc_str}, "
-                    f"T={state['T']:.4f}, prop_dims={meta.get('prop_dims')}, "
-                    f"weight_mode={prop_weight_mode}, sel_mode={selection_mode}"
-                )
-            else:
-                extra = f", Misspredicted: {meta.get('misspredicted')}"
-            results.append(base + extra)
-
+    if policy_replay is not None:
+        policy_replay.assert_complete()
     return df, cat_importances, precision, recall, cat_model, results
 
-def replace_posting(df, posting_id, replacement):
-    df.loc[df['posting_id'] == posting_id, 'pred_label'] = replacement
-    return df
 
 def run_unsupervised(compute_shap=False, early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2, seed=42, run=None):
     df, labels = full_dataprep()
@@ -739,158 +375,174 @@ def run_unsupervised(compute_shap=False, early_stop=False, chunk_size=50, min_de
                   auc=auc, early_stop=early_stop_info)
     return df_cat, cat_importances, precision, recall, cat_model, initial_shap
 
-def run_supervised(training_strat= 'retrain', l=10, corrected_weights=100, corrected_saved=True, strategy="entropy", return_full_data=False, greedy_batching=False, greedy_T=None, compute_shap=False, skip_retrain_on_skip=False, propagation_space=None, prop_weight_mode="uniform", selection_mode="uncertainty", early_stop=False, chunk_size=50, min_delta=0.001, stop_patience=2, seed=42, retrain_every=1, propagation_mode="auto_greedy", prop_k=2, prop_delta=0.25, feature_space="off", basket_alpha=0.5, n_representatives=3, rep_selection="farthest_point", fallback="family"):
-    if propagation_mode in ("shap_box", "shap_box_u", "reviewer_box"):
-        needs_shap = True
-        greedy_batching = True  # Prüfer-Regel ist Einzelfall-basiert (ein Seed pro Iteration)
-    elif propagation_mode in ("cluster_baskets", "cluster_baskets_oracle", "cluster_baskets_direct", "label_consistent_baskets", "label_consistent_baskets_k"):
-        needs_shap = True
-        greedy_batching = True
-    elif propagation_mode == "path_groups":
-        needs_shap = False
-        greedy_batching = True
+
+def _fit_target_agreement(pred, score, ids, trusted_targets,
+                                    direct_labels, prop_targets):
+    targets = dict(trusted_targets)
+    targets.update(prop_targets)
+    targets.update(direct_labels)
+    positives = int(sum(targets.values()))
+    anomaly_weight = max(5.0, len(targets) / positives) if positives else 5.0
+    row_by_id = {pid: row for row, pid in enumerate(ids)}
+    sources = {
+        "pseudo": {pid: label for pid, label in trusted_targets.items()
+                   if pid not in direct_labels and pid not in prop_targets},
+        "propagated": prop_targets,
+        "direct": direct_labels,
+    }
+    probs = np.clip(np.asarray(score, dtype=float), 1e-15, 1.0 - 1e-15)
+    predictions = np.asarray(pred, dtype=int)
+    result = {}
+    for source, labels in sources.items():
+        if not labels:
+            result[source] = {"n": 0, "agreement": None, "log_loss": None,
+                              "objective_weighted_agreement": None,
+                              "objective_weighted_log_loss": None}
+            continue
+        rows = np.fromiter((row_by_id[pid] for pid in labels), dtype=int, count=len(labels))
+        y = np.fromiter((labels[ids[row]] for row in rows), dtype=int, count=len(rows))
+        matched = predictions[rows] == y
+        losses = -(y * np.log(probs[rows]) + (1 - y) * np.log(1 - probs[rows]))
+        weights = np.where(y == 1, anomaly_weight, 1.0)
+        if source == "direct":
+            weights *= 100.0
+        result[source] = {
+            "n": int(len(rows)), "agreement": float(np.mean(matched)),
+            "log_loss": float(np.mean(losses)),
+            "objective_weighted_agreement": float(np.average(matched, weights=weights)),
+            "objective_weighted_log_loss": float(np.average(losses, weights=weights)),
+        }
+    return result
+
+def run_supervised(training_strat="retrain", l=10, corrected_weights=100,
+                   corrected_saved=True, strategy="margin", return_full_data=False,
+                   greedy_batching=False, greedy_T=None, compute_shap=False,
+                   skip_retrain_on_skip=False, propagation_space=None,
+                   prop_weight_mode="uniform", selection_mode="uncertainty",
+                   early_stop=False, chunk_size=50, min_delta=0.001,
+                   stop_patience=2, seed=42, retrain_every=1,
+                   propagation_mode=None, prop_k=2, prop_delta=0.25,
+                   feature_space="off", basket_alpha=0.5,
+                   n_representatives=3, rep_selection="farthest_point",
+                   fallback="family", uncertainty_trace=False,
+                   split_training=False, policy_mode=None, policy_path=None,
+                   review_callback=None, phase_callback=None):
+    """Run canonical workflow using established legacy-style call interface."""
+    if training_strat != "retrain":
+        raise ValueError("Root main.py canonical workflows use training_strat='retrain'")
+    if propagation_mode not in (None, "shap_box_selection"):
+        raise ValueError(
+            f"Propagation mode {propagation_mode!r} lives in legacy/main.py"
+        )
+    tagged = propagation_mode == "shap_box_selection"
+    if tagged and review_callback is not None:
+        policy_mode = "manual"
     else:
-        needs_shap = any(s.startswith("shap") for s in propagation_space) if propagation_space else False
-    config = dict(timestamp=datetime.now().isoformat(timespec="seconds"),
-                  training_strat=training_strat, l=l, corrected_weights=corrected_weights,
-                  corrected_saved=corrected_saved, strategy=strategy,
-                  greedy_batching=greedy_batching, greedy_T=greedy_T, compute_shap=needs_shap,
-                  skip_retrain_on_skip=skip_retrain_on_skip, propagation_space=propagation_space,
-                  prop_weight_mode=prop_weight_mode, selection_mode=selection_mode,
-                  early_stop=early_stop, chunk_size=chunk_size, min_delta=min_delta,
-                  stop_patience=stop_patience, seed=seed, retrain_every=retrain_every,
-                propagation_mode=propagation_mode, prop_k=prop_k, prop_delta=prop_delta,
-                feature_space=feature_space, basket_alpha=basket_alpha,
-                n_representatives=n_representatives, rep_selection=rep_selection,
-                fallback=fallback)
+        policy_mode = (policy_mode or "discover") if tagged else "none"
+    if tagged and policy_mode not in ("discover", "replay"):
+        if policy_mode != "manual":
+            raise ValueError("policy_mode must be 'discover', 'replay', or 'manual'")
+    needs_shap = tagged or compute_shap
+    config = dict(
+        timestamp=datetime.now().isoformat(timespec="seconds"),
+        training_strat=training_strat, l=l, corrected_weights=corrected_weights,
+        corrected_saved=corrected_saved, strategy=strategy,
+        return_full_data=return_full_data, greedy_batching=greedy_batching,
+        greedy_T=greedy_T, compute_shap=needs_shap,
+        skip_retrain_on_skip=skip_retrain_on_skip,
+        propagation_space=propagation_space, prop_weight_mode=prop_weight_mode,
+        selection_mode=selection_mode, early_stop=early_stop,
+        chunk_size=chunk_size, min_delta=min_delta,
+        stop_patience=stop_patience, seed=seed, retrain_every=retrain_every,
+        propagation_mode=propagation_mode, prop_k=prop_k, prop_delta=prop_delta,
+        feature_space=feature_space, basket_alpha=basket_alpha,
+        n_representatives=n_representatives, rep_selection=rep_selection,
+        fallback=fallback, uncertainty_trace=bool(uncertainty_trace),
+        split_training=bool(split_training), policy_mode=policy_mode,
+        policy_source_path=str(policy_path) if policy_path is not None else None,
+    )
+    if tagged and policy_mode == "replay" and not policy_path:
+        raise ValueError("policy_path is required for policy_mode='replay'")
+    if tagged and policy_mode == "discover" and policy_path is not None:
+        raise ValueError("policy_path is only valid for policy_mode='replay'")
+    if tagged and policy_mode == "manual" and policy_path is not None:
+        raise ValueError("Manual reviewer policies are held in memory; policy_path is unused")
+    if tagged and policy_mode == "manual" and review_callback is None:
+        raise ValueError("policy_mode='manual' requires review_callback")
+    policy_replay = (
+        load_policy_replay(policy_path, config) if policy_mode == "replay" else None
+    )
+    config["policy_source_run_id"] = (
+        policy_replay.source_run_id if policy_replay is not None else None
+    )
     run = logstore.open_run(config)
     t0 = time.time()
+    if tagged and policy_mode == "discover":
+        print(f"SHAP-box policy discovery log: {logstore.RUNS_DIR}/{run.run_id}.jsonl")
     try:
-        df, cat_importances, precision, recall, cat_model, initial_shap = run_unsupervised(
-            compute_shap=needs_shap, early_stop=early_stop, chunk_size=chunk_size,
-            min_delta=min_delta, stop_patience=stop_patience, seed=seed, run=run)
-        if training_strat == 'incremental':
-            df, cat_importances, precision, recall, cat_model, results = incremental_catboost(
-                df, l, corrected_weights, corrected_saved, strategy,
-                greedy_batching=greedy_batching, greedy_T=greedy_T,
-                compute_shap=needs_shap, skip_retrain_on_skip=skip_retrain_on_skip,
-                propagation_space=propagation_space, initial_shap=initial_shap,
-                initial_model=cat_model,
-                prop_weight_mode=prop_weight_mode, selection_mode=selection_mode,
-                early_stop=early_stop, chunk_size=chunk_size, min_delta=min_delta,
-                stop_patience=stop_patience, seed=seed, run=run, retrain_every=retrain_every,
-                propagation_mode=propagation_mode, prop_k=prop_k, prop_delta=prop_delta,
-                feature_space=feature_space, basket_alpha=basket_alpha,
-                n_representatives=n_representatives, rep_selection=rep_selection,
-                fallback=fallback)
-        else:
-            df, cat_importances, precision, recall, results = retrain_catboost(
-                df, l, corrected_weights, corrected_saved, strategy,
-                greedy_batching=greedy_batching, greedy_T=greedy_T,
-                compute_shap=needs_shap, skip_retrain_on_skip=skip_retrain_on_skip,
-                propagation_space=propagation_space, initial_shap=initial_shap,
-                initial_model=cat_model,
-                prop_weight_mode=prop_weight_mode, selection_mode=selection_mode,
-                early_stop=early_stop, chunk_size=chunk_size, min_delta=min_delta,
-                stop_patience=stop_patience, seed=seed, run=run, retrain_every=retrain_every,
-                propagation_mode=propagation_mode, prop_k=prop_k, prop_delta=prop_delta,
-                feature_space=feature_space, basket_alpha=basket_alpha,
-                n_representatives=n_representatives, rep_selection=rep_selection,
-                fallback=fallback)
-        run.close(wall_time_s=time.time() - t0, final_precision=precision, final_recall=recall)
-        printed_run_id = run.run_id
-        test_logger(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] | run_id= {printed_run_id} | training_strat= {training_strat}, l={l}, corrected_weights = {corrected_weights}, corrected_saved = {corrected_saved}, strategy = {strategy}, greedy_batching = {greedy_batching}, greedy_T = {greedy_T}, compute_shap = {needs_shap}, skip_retrain_on_skip = {skip_retrain_on_skip}, propagation_space = {propagation_space}, prop_weight_mode = {prop_weight_mode}, selection_mode = {selection_mode}, early_stop = {early_stop}, chunk_size = {chunk_size}, min_delta = {min_delta}, stop_patience = {stop_patience}, seed = {seed}, retrain_every = {retrain_every}, propagation_mode = {propagation_mode}, prop_k = {prop_k}, prop_delta = {prop_delta}, feature_space = {feature_space}, n_representatives = {n_representatives}, rep_selection = {rep_selection}, fallback = {fallback}", results)
+        if phase_callback is not None:
+            phase_callback("initial_training", 0, l, retrain_every)
+        df, _, _, _, initial_model, initial_shap = run_unsupervised(
+            compute_shap=needs_shap, early_stop=early_stop,
+            chunk_size=chunk_size, min_delta=min_delta,
+            stop_patience=stop_patience, seed=seed, run=run)
+        if phase_callback is not None:
+            phase_callback("review", 0, l, retrain_every)
+        df, importances, precision, recall, model, results = retrain_catboost(
+            df, l=l, corrected_weights=corrected_weights,
+            corrected_saved=corrected_saved, strategy=strategy,
+            greedy_batching=greedy_batching, greedy_T=greedy_T,
+            compute_shap=needs_shap, skip_retrain_on_skip=skip_retrain_on_skip,
+            propagation_space=propagation_space, initial_shap=initial_shap,
+            initial_model=initial_model, prop_weight_mode=prop_weight_mode,
+            selection_mode=selection_mode, early_stop=early_stop,
+            chunk_size=chunk_size, min_delta=min_delta,
+            stop_patience=stop_patience, seed=seed, run=run,
+            retrain_every=retrain_every, propagation_mode=propagation_mode,
+            split_training=split_training, policy_mode=policy_mode,
+            policy_replay=policy_replay, review_callback=review_callback,
+            phase_callback=phase_callback)
+        run.close(wall_time_s=time.time() - t0,
+                  final_precision=precision, final_recall=recall)
+        if phase_callback is not None:
+            phase_callback("complete", l, l, retrain_every)
+        test_logger(
+            f"[{datetime.now():%Y-%m-%d %H:%M:%S}] | run_id={run.run_id} | "
+            f"training_strat={training_strat}, l={l}, corrected_weights={corrected_weights}, "
+            f"corrected_saved={corrected_saved}, strategy={strategy}, "
+            f"greedy_batching={greedy_batching}, greedy_T={greedy_T}, "
+            f"compute_shap={needs_shap}, propagation_space={propagation_space}, "
+            f"prop_weight_mode={prop_weight_mode}, selection_mode={selection_mode}, "
+            f"retrain_every={retrain_every}, propagation_mode={propagation_mode}, "
+            f"split_training={split_training}, policy_mode={policy_mode}, "
+            f"seed={seed}", results)
+        return df, importances, precision, recall, model
     except Exception:
         run.close(wall_time_s=time.time() - t0)
+        if phase_callback is not None:
+            phase_callback("error", None, l, retrain_every)
         raise
-    return df, cat_importances, precision, recall, cat_model
+
 
 if __name__ == "__main__":
-
-    seeds = [42
-            # , 50, 100, 136, 389
-             ]
-    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="uniform", selection_mode="uncertainty")
-    
-    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="linear_decay", selection_mode="uncertainty")
-    
-    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="uniform", selection_mode="uncertainty_density")
-    
-    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="linear_decay")
-    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], selection_mode="uncertainty_density")
-    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], prop_weight_mode="linear_decay", selection_mode="uncertainty_density")
-    #df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='incremental', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", return_full_data=False, greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
-    
-    # ========================================================================
-    # TO TEST: Prüfer-Regel (shap_box, ADAPTIVE Feature-Selektion) l=500, absolut
-    # ========================================================================
-    # Aktiv: adaptive shap_box mit feature_space="off", l=500, retrain_every=1 (absolut).
-    # Vergleich gegen V1-l500 (data.jsonl: Peak 145-152, Gift-Box @153) und Baseline 0.664.
-    # prop_k entfällt (adaptives k), prop_delta=0.25. feature_space-Varianten danach:
-    #   "value_box" / "perfect_knowledge" (siehe §4 Decision 12).
-    # Keine Parameter-Anpassung an Ergebnissen -> siehe PROJECT_CONTEXT §9.
-
-    # --- cluster_baskets, l=500, margin, retrain_every=15 ---
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=15, propagation_mode="cluster_baskets", basket_alpha=0.5)
-    # Alternative: feste Oracle-Centroids statt organisch gemittelter Basket-Centroids.
-    # --- path_groups (I1): 1 most-uncertain Case/Iteration reviewen, Label auf alle
-    # Cases mit identischem Leaf-Pfad (500 Baeume) propagieren; Retrain alle 25 ---
-    # for se in seeds:
-    #     df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, retrain_every=25, propagation_mode="path_groups", seed=se)
-    # --- shap_box_u (I5): shap_box-Familie, delta pro Kandidat aus Unsicherheits-RANG;
-    # untere 50% delta=0, obere 50% ramp 0..0.5; nur Error-Seeds, same-pred, reviewed geschuetzt ---
-    for se in seeds:
-        df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=10, propagation_mode="shap_box_u", seed=se)
-        df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=10, propagation_mode="shap_box", seed=se)
-    # --- reviewer_box (deaktiviert) ---
-    # for se in seeds:
-    #     df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=500, propagation_mode="reviewer_box", basket_alpha=0.5, seed=se,n_representatives=5)
-    # --- label_consistent_baskets_k: label_consistent_baskets + shap_box-adaptives Top-k ---
-    # Ablation: identisch zu label_consistent_baskets, nur Distanzen/Assignment/Konflikte
-    # laufen im adaptiven entscheidungsrelevanten Top-k-Raum des jeweiligen Seeds.
-    #for se in seeds:
-    #    df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=500, propagation_mode="label_consistent_baskets_k", basket_alpha=0.5, seed=se)
-    # --- naive Baseline: 1 most-uncertain Case/Iteration, keine Propagation, Retrain alle 25 ---
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=False, retrain_every=25, seed=42)
-    # --- reviewer_box: shap_box-Familie + reviewer-informierter Feature-Space-Filter ---
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=25, propagation_mode="reviewer_box", n_representatives=3, rep_selection="farthest_point", fallback="family", seed=42)
-    # Experiment: alle Oracle-Centroids sofort aktiv; Matching nur ueber aktuelle Modell-SHAPs.
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="cluster_baskets_direct")
-    # Experiment: Reviewer-Phasen mit label-konsistenter Propagation und Konflikt-Subclustering.
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="label_consistent_baskets")
-    # --- adaptive shap_box, feature_space=value_box, l=500, absolut ---
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_delta=0.25, feature_space="value_box")
-
-    # --- adaptive shap_box, feature_space=perfect_knowledge, l=500, absolut ---
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_delta=0.25, feature_space="perfect_knowledge")
-
-    # ================ Referenz: V1 shap_box l=500 (gelaufen, data.jsonl) ================
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=500, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_k=2, prop_delta=0.25)
-
-    # ================ Referenz: 4 gelaufene l=100-Runs ================
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=10)
-
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], retrain_every=50)
-
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
-
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=100, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], propagation_mode="shap_box", prop_k=2, prop_delta=0.25)
-
-    # --- greedy + shap_raw, Baseline OFF (Referenz/Wandzeit) ---
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"])
-
-    # --- greedy + shap_raw, early_stop STRICT ---
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], early_stop=True, chunk_size=50, min_delta=0.01, stop_patience=2)
-
-    # --- greedy + shap_raw, early_stop MODERATE ---
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", greedy_batching=True, greedy_T=0.5, propagation_space=["shap_raw"], early_stop=True, chunk_size=50, min_delta=0.001, stop_patience=2)
-
-    # --- non-greedy (uncertainty) Baseline OFF, reiner Laufzeit-Vergleich ---
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin")
-
-    # --- non-greedy, early_stop STRICT ---
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", early_stop=True, chunk_size=50, min_delta=0.01, stop_patience=2)
-
-    # --- non-greedy, early_stop MODERATE ---
-    # df, cat_importances, precision, recall, cat_model = run_supervised(training_strat='retrain', l=30, corrected_weights=100, corrected_saved=True, strategy="margin", early_stop=True, chunk_size=50, min_delta=0.001, stop_patience=2)
-    
+    #choose one run configuration below
+    # df, cat_importances, precision, recall, cat_model = run_supervised(
+    #     training_strat="retrain", l=500, corrected_weights=100,
+    #     corrected_saved=True, strategy="random", retrain_every=25)
+    # df, cat_importances, precision, recall, cat_model = run_supervised(
+    #     training_strat="retrain", l=500, corrected_weights=100,
+    #     corrected_saved=True, strategy="margin", retrain_every=25)
+    # df, cat_importances, precision, recall, cat_model = run_supervised(
+    #     training_strat="retrain", l=500, corrected_weights=100,
+    #     corrected_saved=True, strategy="margin", split_training=True,
+    #     retrain_every=25)
+    # df, cat_importances, precision, recall, cat_model = run_supervised(
+    #     training_strat="retrain", l=500, corrected_weights=100,
+    #     corrected_saved=True, strategy="margin",
+    #     propagation_mode="shap_box_selection", retrain_every=25)
+    # df, cat_importances, precision, recall, cat_model = run_supervised(
+    #     training_strat="retrain", l=500, corrected_weights=100,
+    #     corrected_saved=True, strategy="margin",
+    #     propagation_mode="shap_box_selection", split_training=True,
+    #     retrain_every=25)
+    pass

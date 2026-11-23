@@ -1,4 +1,4 @@
-# Logistic Regression (RIVER / true online learning)
+#online logistic regression with river
 from river import linear_model, preprocessing, optim, metrics
 import pandas as pd
 import numpy as np

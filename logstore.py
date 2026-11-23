@@ -64,7 +64,7 @@ class RunLog:
                 h.flush()
 
     def tree_count(self):
-        raise NotImplementedError  # place-holder, unused
+        raise NotImplementedError  #unused placeholder
 
     def close(self, **summary_fields):
         rec = {"kind": "summary"}
@@ -78,7 +78,7 @@ class RunLog:
 
 
 def load_runs(paths=None):
-    """All JSONL runs -> one DataFrame (header + all records joinlined)."""
+    """Load run records from JSONL files into a DataFrame."""
     all_paths = []
     if paths is None:
         if os.path.isdir(RUNS_DIR):

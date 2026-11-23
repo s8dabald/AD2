@@ -6,16 +6,18 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 from querystep import margin_uncertainty, entropy_uncertainty, novelty_uncertainty
+from propagation import FLAG_PREFIXES, get_feature_cols, _adaptive_topk
 
-# Flag-based features: rule checks (promptly, weekend, nwh, top_n, high_cash).
-# These are excluded when using features_raw.
-FLAG_PREFIXES = ("promptly_", "weekend_", "nwh_", "top_n_", "high_cash_")
+_LEGACY_PROBE_OUT = os.path.join(os.path.dirname(__file__), "probe_out")
+_IDEAL_MAP = None
+_IDEAL_NAMES = None
+_IDEAL_CENTROIDS = None
 
-
-def get_feature_cols(df):
-    """All model feature columns (everything except label, posting_id, pred_label, pred_score)."""
-    return df.drop(columns=["label", "posting_id", "pred_label", "pred_score"]).columns.tolist()
-
+_ORIGINAL_NUM_CONST = ["date_difference"]
+_ORIGINAL_CAT_CONST = ["tax_rate", "user"]
+_ORIGINAL_CAT_EXPANDED = ["gl_account_name", "cd_flag", "promptly", "weekend",
+                          "nwh", "top_n", "high_cash"]
+_ORIGINAL_NUM_EXPANDED = ["amount"]
 
 def _get_feature_groups(df):
     """Split feature columns into raw (values) and flags (rule checks).
@@ -60,7 +62,7 @@ def new_state(T=None, propagation_space=None, seed=42):
         "nearest": None,
         "covered_arr": None,
         "novelty_scores": None,
-        # propagation
+        #propagation state
         "propagation_space": propagation_space or ["features_all"],
         "prop_scaled": None,
         "prop_raw_scaled": None,
@@ -68,13 +70,13 @@ def new_state(T=None, propagation_space=None, seed=42):
         "shap_vals": None,
         "shap_raw_indices": None,
         "shap_flag_indices": None,
-        # matrix cache
+        #matrix cache
         "prop_matrix": None,
     "prop_matrix_shap_id": None,
-    # selection / weighting
+    #selection and weighting state
     "nearest_dist": None,
     "neighbor_density": None,
-    # cluster_baskets
+    #basket clustering state
     "pipeline_baskets": [],
     "case_to_basket": {},
     "candidate_case_to_basket": {},
@@ -96,13 +98,12 @@ def new_state(T=None, propagation_space=None, seed=42):
 }
 
 
-
 def _ensure_propagation(df, state):
     """Scale feature groups and compute SHAP indices. Everything is cached (1x)."""
     groups = _get_feature_groups(df)
     ps = state["propagation_space"]
     n = len(df)
-    # Scale feature groups on first call, then reuse
+    #scale once and reuse
     if "features_all" in ps and state["prop_scaled"] is None:
         state["prop_scaled"] = StandardScaler().fit_transform(df[groups["features_all"]].values)
     if "features_raw" in ps and state["prop_raw_scaled"] is None:
@@ -113,7 +114,7 @@ def _ensure_propagation(df, state):
     if state["X_ids"] is None:
         state["X_ids"] = df["posting_id"].values
 
-    # Compute SHAP column indices once (mapping from feature_cols order to SHAP columns)
+    #map feature columns to SHAP columns once
     if state["shap_raw_indices"] is None and any(s.startswith("shap") for s in ps):
         all_features = groups["features_all"]
         state["shap_raw_indices"] = [i for i, f in enumerate(all_features)
@@ -175,8 +176,7 @@ def _prop_dims(state):
 
 
 def _compute_neighbor_density(state):
-    """Anzahl Nachbarn innerhalb Radius T für jeden Fall in Propagierungs-Raum.
-    Wird nach jedem SHAP-Update neu berechnet (Matrix ändert sich)."""
+    """Count neighbors within T for each case. Recompute after SHAP updates."""
     from sklearn.neighbors import radius_neighbors_graph
     mat = _build_propagation_matrix(state)
     T = state["T"]
@@ -208,7 +208,7 @@ def center_distances(state, center_id):
 
 
 def _partition_from_cache(state):
-    """Voronoi partition using cached center distances."""
+    """Assign cases to their nearest center using cached distances."""
     center_ids = list(state["centers"].keys())
     dist_matrix = np.column_stack([state["dist_cache"][c] for c in center_ids])
     nearest = dist_matrix.argmin(axis=1)
@@ -221,7 +221,14 @@ def _partition_from_cache(state):
 
 
 def _uncertainty_scores(df, strategy, state):
-    if strategy == "margin":
+    if strategy == "random":
+        if state.get("random_scores") is None:
+            ids = df["posting_id"].astype(str).to_numpy()
+            scores = np.random.RandomState(state.get("seed", 42)).random_sample(len(ids))
+            state["random_scores"] = dict(zip(ids, scores))
+        df["random_query_score"] = df["posting_id"].astype(str).map(state["random_scores"])
+        return df, "random_query_score"
+    elif strategy == "margin":
         df = margin_uncertainty(df, df["pred_score"])
         return df, "margin_uncertainty"
     elif strategy == "entropy":
@@ -239,10 +246,9 @@ def _uncertainty_scores(df, strategy, state):
 
 
 def greedy_iteration(df, strategy, state, selection_mode="uncertainty"):
-    """One greedy iteration: select most uncertain case M, oracle review,
-    new center / split / skip, global re-partition, label propagation.
+    """Review the most uncertain case, update centers, and propagate labels.
 
-    Returns: (df_updated, state_updated, meta)
+    Returns the updated frame, state, and iteration metadata.
     """
     meta = {}
 
@@ -288,7 +294,7 @@ def greedy_iteration(df, strategy, state, selection_mode="uncertainty"):
             meta["type"] = "split"
             meta["split_from"] = cur_center
 
-    # Re-partition only when centers change; reuse on skip
+    #repartition only when centers change
     if meta["type"] in ("new_center", "split"):
         state["dist_cache"][M] = center_distances(state, M)
         nearest, covered = _partition_from_cache(state)
@@ -332,17 +338,10 @@ def greedy_iteration(df, strategy, state, selection_mode="uncertainty"):
 
 
 def path_group_iteration(df, strategy, state, selection_mode="uncertainty"):
-    """One iteration of path-group propagation: review the most uncertain case and
-    propagate its label to all cases that share its leaf path through all trees.
+    """Review one uncertain case and label cases on the same CatBoost leaf path.
 
-    Same seed logic as the other propagation modes (most uncertain, not yet
-    directly corrected). The seed is the only directly corrected case (gets
-    corrected_weights); propagated group members stay at weight 1. Already
-    reviewed cases are never overwritten.
-
-    Needs state["path_groups"] (Series posting_id -> group id) and no SHAP.
-
-    Returns: (df_updated, state_updated, meta)
+    Only the seed gets direct-review weight. Never overwrite reviewed cases.
+    Returns the updated frame, state, and iteration metadata.
     """
     meta = {}
 
@@ -408,31 +407,6 @@ def path_group_iteration(df, strategy, state, selection_mode="uncertainty"):
     return df, state, meta
 
 
-def _adaptive_topk(row, pred_score):
-    """Positions (Index in row/sel_cols) des entscheidungsrelevanten SHAP- prefixes.
-
-    Logit-Baseline = logit(pred_score) - Summe(SHAP); kumuliert vorzeichenbehaftet,
-    das letzte Ueberqueren der Logit-0 bestimmt den k-Hat. Reine SHAP/Score-Logik
-    (kein Label). Gibt (k, order[:k]) zurueck; k=0 heisst Baseline entscheidet
-    bereits -> kein Top-k (Fallback: voller Raum).
-    """
-    p = min(max(pred_score, 1e-7), 1.0 - 1e-7)
-    logit = float(np.log(p / (1.0 - p)))
-    base = logit - float(row.sum())
-    order = np.argsort(-np.abs(row))
-    cum = base + np.cumsum(row[order])
-    tol = 1e-9 * max(1.0, abs(logit))
-    side = np.where(cum >= tol, 1, -1)
-    final = side[-1] if len(side) else 0
-    dev = np.where(side != final)[0]
-    if len(dev):
-        k = int(dev[-1]) + 2  # Prefix bis einschliesslich des Features, das die Endseite fixiert
-    else:
-        k = 0  # Entscheidung steht schon bei der Baseline: keine Familie
-    k = int(min(k, len(row)))
-    return k, order[:k]
-
-
 def _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta,
                        case_delta_mode=False):
     """Shared seed selection + adaptive SHAP decision-space box (candidate family).
@@ -493,10 +467,8 @@ def _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta,
     u_seed = float(df.loc[m_pos, score_col])
     df = df.drop(columns=[score_col])
 
-    # ---- Decision Space: adaptive entscheidende SHAP-Features (echte Werte).
-    # Baseline = Logit - Summe der SHAP-Beitraege im Zielfeatures-Raum; daraus
-    # kumulieren (vorzeichenbehaftet) und das LETZTE Ueberqueren der Logit-0
-    # bestimmen. Danach kann der echte Rest das Vorzeichen nicht mehr kippen.
+    #find decision-relevant SHAP features by the final logit-zero crossing
+    #sum signed contributions from the model baseline to find that prefix
     M_idx = np.where(state["X_ids"] == M)[0][0]
     row = S[M_idx, sel_cols]
     k, topk = _adaptive_topk(row, M_pred_score)
@@ -534,10 +506,10 @@ def _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta,
             hi = v * (1.0 + delta_all)
             mask &= (S[:, j] >= np.minimum(lo, hi)) & (S[:, j] <= np.maximum(lo, hi))
         if not mask.any():
-            mask[M_idx] = True  # Fallback: mindestens der Seed selbst
+            mask[M_idx] = True  #keep the seed itself
         family_size = int(mask.sum())
     else:
-        # k==0: Entscheidung steht bereits an der Baseline -> keine Familie, nur Seed
+        #keep only the seed when the baseline already decides
         mask[M_idx] = True
 
     if case_delta_mode:
@@ -563,38 +535,13 @@ def _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta,
 
 def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
                             prop_k=2, prop_delta=0.25, feature_space="off",
-                            case_delta_mode=False):
-    """Prüfer-Regel-Propagation (shap_box, adaptive Feature-Selektion): Statt
-    Kugel/Voronoi baut der simulierte Prüfer aus der SHAP-Erklärung des reviewed
-    Seeds eine Regel in zwei Ebenen.
+                            case_delta_mode=False, trace=None, iteration=None):
+    """Build a SHAP-box family and optionally filter it by feature values.
 
-    Decision Space: Adaptive Auswahl der SHAP-Features, die den Fall entschieden
-    haben (echte, vorzeichenbehaftete Werte kumuliert ab Baseline; Prefix bis zum
-    LETZTEN Überqueren der Logit-0 — danach kann der echte Rest das Urteil nicht
-    mehr kippen). Kein festes k, keine Betragssummen. Um diese Features werden
-    vorzeichen-erhaltende Bänder [v*(1-delta), v*(1+delta)] gezogen.
-
-    Feature Space (Keyword `feature_space`):
-      - "off": kein Wettere Filter (Verhalten wie bisheriges shap_box).
-      - "value_box": alle Original-Features (features_raw) müssen innerhalb
-        ±prop_delta um die Seed-Werte liegen.
-      - "perfect_knowledge": Werte-Bänder aus den Family-Mitgliedern, deren
-        echtes Label == Prüfer-Urteil über den Seed (min-max pro Original-Feature).
-        Simuliert den Prüfer mit perfekter Kenntnis des gültigen Wertebereichs.
-
-    case_delta_mode=True (shap_box_u): Die Bandbreite ist nicht fix, sondern
-    pro KANDIDAT aus dessen Unsicherheits-RANG u_rank_i in [0,1] abgeleitet:
-    delta_i = 0.5 * clip((u_rank_i - 0.5) / 0.5, 0, 1). Die unteren 50% werden
-    nie verbreitert (delta=0, nur exakte SHAP-Zwillinge); die oberen 50% rampen
-    von 0 bis 0.5. Zusaetzlich expandieren nur Error-Seeds, nur Kandidaten mit
-    gleicher Vorhersage, und direkt reviewte Cases werden nie ueberschrieben.
-    Nur mit feature_space="off" kombinierbar.
-
-    Propagiert wird das Seed-Label auf die finalen Cases (last-writer-wins, ausser
-    bei case_delta_mode: direkt reviewte Cases bleiben geschuetzt). Ist die Region
-    leer, wird nur der Seed selbst korrigiert. Prüfer-Urteil/True Labels fließen
-    NUR bei feature_space="perfect_knowledge" ein — nie in die SHAP-Auswahl.
-    Braucht greedy_batching=True mit shap propagation_space.
+    ``feature_space`` can be ``off``, ``value_box``, or ``perfect_knowledge``.
+    The last option uses stored labels to define value ranges. With
+    ``case_delta_mode``, box width varies by candidate uncertainty rank and only
+    error seeds expand to same-prediction candidates.
     """
     meta = {}
 
@@ -627,7 +574,7 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
     value_bands = None
 
     if k >= 1:
-        # ---- Feature Space: alle Original-Features (features_raw), ohne Flags.
+        #match on original features, excluding flags
         if feature_space in ("value_box", "perfect_knowledge"):
             raw = _get_feature_groups(df)["features_raw"]
             if feature_space == "value_box":
@@ -641,7 +588,7 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
                     value_bands.append((f, lo, hi))
                     val = df[f].values
                     mask &= (val >= lo) & (val <= hi)
-            else:  # perfect_knowledge: Bänder aus Family-Mitgliedern mit Seed-Urteil
+            else:  #use ranges from family members with the seed's label
                 labels = df["label"].values.astype(int)
                 sub = mask & (labels == M_label)
                 if sub.any():
@@ -654,8 +601,9 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
                         mask &= (val >= lo - 1e-12) & (val <= hi + 1e-12)
         if not mask.any():
             mask = np.zeros(len(df), dtype=bool)
-            mask[M_idx] = True  # Fallback: nur der Seed
+            mask[M_idx] = True  #keep the seed itself
 
+    covered_before = set(state.get("covered", set()))
     prev_pred = df["pred_label"].values.copy()
     covered_idxs = np.where(mask)[0]
     if len(covered_idxs):
@@ -672,6 +620,29 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
     new_pred = df["pred_label"].values
     n_changed_correct = int((changed & (new_pred == true_labels)).sum())
     n_changed_wrong = int((changed & (new_pred != true_labels)).sum())
+
+    if trace is not None and len(covered_idxs):
+        try:
+            ids_arr = np.asarray(ids)
+            first_event = ~np.isin(ids_arr[covered_idxs],
+                                   np.fromiter(covered_before, dtype=object))
+            roles = np.where(covered_idxs == M_idx, "seed", "candidate")
+            trace.on_event(
+                iteration=iteration if iteration is not None else -1,
+                seed_id=M,
+                ids=ids_arr[covered_idxs],
+                roles=roles,
+                prev_pred=prev_pred[covered_idxs],
+                new_pred=new_pred[covered_idxs],
+                true_labels=true_labels[covered_idxs],
+                u=box["u_all"][covered_idxs],
+                u_rank=box.get("u_rank_all")[covered_idxs] if box.get("u_rank_all") is not None else None,
+                delta=box["delta_all"][covered_idxs],
+                first_event=first_event,
+                family_size=int(family_size),
+            )
+        except Exception as exc:
+            print(f"[uncertainty-trace] event hook failed: {exc!r}")
     all_features = get_feature_cols(df)
     delta_covered = None
     u_covered = None
@@ -726,15 +697,6 @@ def reviewer_rule_propagate(df, strategy, state, selection_mode="uncertainty",
         meta["propagation_accuracy"] = 1.0
 
     return df, state, meta
-
-
-# --- reviewer_box helpers ---
-
-_ORIGINAL_NUM_CONST = ["date_difference"]
-_ORIGINAL_CAT_CONST = ["tax_rate", "user"]
-_ORIGINAL_CAT_EXPANDED = ["gl_account_name", "cd_flag", "promptly", "weekend",
-                          "nwh", "top_n", "high_cash"]
-_ORIGINAL_NUM_EXPANDED = ["amount"]
 
 
 def _map_columns_to_original_features(df):
@@ -812,7 +774,7 @@ def _select_representatives(S, mask, M_idx, col_idx, n, strategy, seed, exclude_
             dist = np.linalg.norm(sub[members] - ctr, axis=1)
             reps.append(int(members[int(np.argmin(dist))]))
         return reps
-    # farthest_point (default): greedy k-center from the seed
+    #farthest-point selection uses greedy k-center from the seed
     d_seed = np.linalg.norm(sub[cand] - sub[M_idx], axis=1)
     chosen = [int(cand[int(np.lexsort((cand, -d_seed))[0])])]
     min_d = np.linalg.norm(sub[cand] - sub[chosen[0]], axis=1)
@@ -835,14 +797,10 @@ def _active_category(df, cols, case_idx):
 
 
 def _derive_reviewer_value_rule(df, seed_idx, accepted, rejected, units, prop_delta):
-    """Derive a conservative feature-space rule from reviewed representatives.
+    """Build a feature-value rule that separates accepted and rejected reviews.
 
-    Returns a list of constraints (strict conjunction) or None when no
-    discriminating feature could be established from the reviewed cases only.
-    Numeric units: interval [min_A - pad, max_A + pad] (pad from prop_delta),
-    kept only if some rejected value falls outside. Categorical units: excluded
-    categories = rejected active cats not present in any accepted case, kept
-    only if non-empty.
+    Return a list of combined constraints, or None if reviews provide no
+    distinguishing feature.
     """
     accepted = list(dict.fromkeys(list(accepted) + [seed_idx]))
     rejected = list(dict.fromkeys(list(rejected)))
@@ -896,16 +854,11 @@ def _apply_value_rule(df, mask, rule):
 def reviewer_box_iteration(df, strategy, state, selection_mode="uncertainty",
                            n_representatives=3, rep_selection="farthest_point",
                            fallback="family", prop_delta=0.25):
-    """reviewer_box: SHAP-Box-Kandidatenfamilie + reviewer-informierter Feature-Space-Filter.
+    """Filter a seed's SHAP-box family using a few diverse reviewed examples.
 
-    Seed und Kandidatenfamilie identisch zu shap_box. Zusätzlich werden
-    n_representatives weitere Fälle aus der Familie simuliert geprüft (label-frei
-    nach Diversität im SHAP-Raum gewählt); daraus wird eine sparsame
-    Feature-Space-Regel abgeleitet (nur trennende Original-Features), die die
-    Familie einschränkt. Keine Regel ableitbar -> Fallback ("family" = volle
-    SHAP-Box-Familie, "seed_only" = nur der Seed). Reviewte Reps erhalten
-    direkt_corrected (HITL-Gewichtung), behalten aber ihr Prüfer-Label und
-    werden nicht mit M_label propagiert.
+    Derive a feature-value rule from the representatives. If no rule separates
+    them, use the configured family or seed-only fallback. Keep reviewed labels
+    unchanged and do not propagate the seed label to those representatives.
     """
     meta = {}
     df, box = _seed_and_shap_box(df, state, strategy, selection_mode, prop_delta)
@@ -930,8 +883,8 @@ def reviewer_box_iteration(df, strategy, state, selection_mode="uncertainty",
     all_features = get_feature_cols(df)
     units = _build_feature_units(df, col_idx, all_features)
 
-    # 1) Repräsentanten wählen (label-frei, ohne bereits geprüfte Fälle) und
-    #    simulierten Prüfer anwenden (Urteil = echtes Label der Reps).
+    #choose unreviewed representatives without using labels
+    #simulate review with each representative's stored label
     reviewed_set = set(str(p) for p in state.get("directly_corrected", set()))
     exclude_idx = np.array([i for i in range(len(ids)) if str(ids[i]) in reviewed_set],
                            dtype=int)
@@ -950,7 +903,7 @@ def reviewer_box_iteration(df, strategy, state, selection_mode="uncertainty",
         else:
             rejected.append(int(ridx))
 
-    # 2) Feature-Space-Regel aus den reviewten Reps ableiten
+    #derive a feature-space rule from reviewed representatives
     rule = _derive_reviewer_value_rule(df, M_idx, accepted, rejected, units, prop_delta)
     fallback_used = False
     if rule is None:
@@ -958,13 +911,13 @@ def reviewer_box_iteration(df, strategy, state, selection_mode="uncertainty",
         if fallback == "seed_only":
             mask = np.zeros(len(df), dtype=bool)
             mask[M_idx] = True
-        # "family": SHAP-Box-Familie unverändert propagieren
+        #keep the full SHAP-box family
     else:
         mask = _apply_value_rule(df, mask, rule)
         if not mask.any():
             mask[M_idx] = True
 
-    # 3) Propagation: nur Familie OHNE reviewte Reps (deren Label ist bereits korrekt)
+    #propagate only to family members that were not directly reviewed
     prev_pred = df["pred_label"].values.copy()
     rep_set = set(rep_labels.keys())
     prop_idxs = np.array([i for i in np.where(mask)[0] if i not in rep_set], dtype=int)
@@ -1012,20 +965,11 @@ def reviewer_box_iteration(df, strategy, state, selection_mode="uncertainty",
     return df, state, meta
 
 
-# --- Cluster Baskets helpers ---
-
-# --- Cluster Baskets helpers ---
-
-_IDEAL_MAP = None
-_IDEAL_NAMES = None
-_IDEAL_CENTROIDS = None
-
-
 def _load_ideal():
     global _IDEAL_MAP, _IDEAL_NAMES, _IDEAL_CENTROIDS
     if _IDEAL_MAP is not None:
         return _IDEAL_MAP, _IDEAL_NAMES
-    ideal_path = "probe_out/ideal_membership.csv"
+    ideal_path = os.path.join(_LEGACY_PROBE_OUT, "ideal_membership.csv")
     if os.path.exists(ideal_path):
         try:
             dfm = pd.read_csv(ideal_path)
@@ -1035,7 +979,7 @@ def _load_ideal():
             _IDEAL_MAP = {}
     else:
         _IDEAL_MAP = {}
-    names_path = "probe_out/ideal_baskets_centroids_std.csv"
+    names_path = os.path.join(_LEGACY_PROBE_OUT, "ideal_baskets_centroids_std.csv")
     if os.path.exists(names_path):
         try:
             dfn = pd.read_csv(names_path)
@@ -1089,12 +1033,7 @@ def _oracle_basket_for(pid):
 
 
 def _reviewer_basket_for(pid, fallback_bid, fallback_label, fallback_name=""):
-    """Return the simulated reviewer's selected basket for a case.
-
-    The current offline experiment uses the Oracle mapping as its deterministic
-    reviewer decision. Keeping that lookup behind this helper makes the
-    selected basket explicit and leaves one seam for a future UI/API decision.
-    """
+    """Return the simulated reviewer's basket, or the supplied fallback."""
     selected_bid, selected_label, selected_name = _oracle_basket_for(pid)
     if selected_bid is None:
         return fallback_bid, fallback_label, fallback_name
@@ -1106,9 +1045,8 @@ def _oracle_centroid_for(basket_id, sel_cols):
     centroid = _IDEAL_CENTROIDS.get(basket_id) if _IDEAL_CENTROIDS else None
     if centroid is None:
         return None
-    # The exported Oracle centroids are already in the selected SHAP space
-    # (e.g. 52 shap_raw dimensions), while sel_cols refers to full-model
-    # feature positions. Do not apply those full-space indices a second time.
+    #oracle centroids already use the selected SHAP space
+    #sel_cols use full-model positions, so do not slice them again
     if len(centroid) == len(sel_cols):
         return centroid
     if max(sel_cols, default=-1) >= len(centroid):
@@ -1193,11 +1131,11 @@ def _assign_unreviewed(state, S_std, ids, positions=None):
     if S_std is None or len(state["pipeline_baskets"]) == 0:
         return
     _ensure_basket_centroids(state, S_std, ids)
-    # ensure centroids exist (fallback to zero if empty)
+    #create empty centroids if needed
     for b in state["pipeline_baskets"]:
         if b["centroid_std"] is None:
             b["centroid_std"] = np.zeros(S_std.shape[1])
-    # build centroids matrix
+    #build centroid matrix
     cents = np.stack([b["centroid_std"] for b in state["pipeline_baskets"]], axis=0)
     b_ids = [b["id"] for b in state["pipeline_baskets"]]
     if positions is not None and len(positions):
@@ -1239,9 +1177,9 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
     _ensure_basket_centroids(state, S_std, ids)
 
     df, score_col = _uncertainty_scores(df, strategy, state)
-    pool_mask = ~df["posting_id"].isin(state["directly_corrected"]) if False else True  # reviewed excluded from selection? reviewed are directly_corrected
+    pool_mask = ~df["posting_id"].isin(state["directly_corrected"]) if False else True  #reviewed cases are directly corrected
     pool_mask = ~df["posting_id"].astype(str).isin([str(p) for p in state.get("directly_corrected", set())]) if False else ~np.isin(df["posting_id"], list(state.get("directly_corrected", set())))
-    # easier: exclude reviewed
+    #exclude reviewed cases
     reviewed_set = set(str(pid) for pid in state.get("directly_corrected", set()))
     pool = df[~df["posting_id"].astype(str).isin(reviewed_set)]
 
@@ -1250,12 +1188,12 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
         meta["type"] = "no_candidates"
         return df, state, meta
 
-    # compute basket_fit: dist to assigned basket (adaptive_topk: vorheriger Seed-topk-Raum)
+    #measure distance in the previous seed's adaptive top-k space
     if S_std is not None and len(state["pipeline_baskets"]) > 0:
         id_to_idx = {pid: i for i, pid in enumerate(ids)}
         cents = np.stack([b["centroid_std"] for b in state["pipeline_baskets"]], axis=0)
         b_ids_list = [b["id"] for b in state["pipeline_baskets"]]
-        # map id->basket
+        #map each id to its basket
         id_to_b = state["case_to_basket"]
         d_to_b = np.full(len(ids), np.inf)
         pos = state.get("topk_pos") if adaptive_topk else None
@@ -1287,7 +1225,7 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
         state["topk_pos"] = pos_top if k_top >= 1 else None
         state["topk_fallback"] = k_top < 1
 
-    # determine basket from ideal
+    #get the ideal basket assignment
     ideal_bid, ideal_label, ideal_name = _oracle_basket_for(M)
     if ideal_bid is None:
         ideal_bid, ideal_label, ideal_name = 0, int(df.loc[m_pos, "label"]), ""
@@ -1313,7 +1251,7 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
         ideal_bid, ideal_label, ideal_name = selected
 
     pb = _get_or_create_pipeline_basket(state, ideal_bid, ideal_label, ideal_name)
-    # mark reviewed
+    #mark reviewed cases
     pb["reviewed_ids"].add(M_str)
     state["directly_corrected"].add(M)
     state["case_to_basket"][M_str] = pb["id"]
@@ -1339,7 +1277,7 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
                 state["case_to_basket"].pop(pid, None)
                 state["case_source"].pop(pid, None)
 
-    # propagate labels
+    #propagate labels
     assigned_bids = np.asarray(
         [state["case_to_basket"].get(str(pid), -1) for pid in ids],
         dtype=object,
@@ -1354,7 +1292,7 @@ def cluster_baskets_iteration(df, strategy, state, selection_mode="uncertainty",
         df["pred_label"] = pred_labels
 
     changed = df["pred_label"].values != prev_pred
-    state["covered"] = set(ids)  # all assigned conceptually
+    state["covered"] = set(ids)  #mark every case as covered
     meta["M"] = M
     meta["type"] = "basket_add" if len(pb["reviewed_ids"]) == 1 else "basket_update"
     meta["n_baskets"] = len(state["pipeline_baskets"])
@@ -1578,7 +1516,7 @@ def label_consistent_basket_iteration(df, strategy, state, selection_mode="uncer
 
 
 def cluster_baskets_oracle_iteration(df, strategy, state, selection_mode="uncertainty", basket_alpha=0.5):
-    """Cluster-basket propagation using fixed Oracle centroids from probe output."""
+    """Propagate labels using fixed oracle centroids from the probe output."""
     _ensure_propagation(df, state)
     ps = state["propagation_space"]
     if "shap_raw" in ps and state["shap_raw_indices"] is not None:
@@ -1672,7 +1610,7 @@ def cluster_baskets_oracle_iteration(df, strategy, state, selection_mode="uncert
 
 
 def cluster_baskets_direct_iteration(df, state):
-    """Recluster current SHAPs like the ideal-basket probe and map clusters."""
+    """Recluster current SHAP values and map clusters to ideal baskets."""
     _ensure_propagation(df, state)
     ps = state["propagation_space"]
     if "shap_raw" in ps and state["shap_raw_indices"] is not None:
@@ -1687,8 +1625,7 @@ def cluster_baskets_direct_iteration(df, state):
         raise ValueError("cluster_baskets_direct needs shap_vals")
 
     S_raw = state["shap_vals"][:, sel_cols]
-    # Match shap_cluster_probe.py: fit the scaler on the current SHAP matrix
-    # for every clustering pass, then cluster the scaled embedding.
+    #fit the scaler on each pass's SHAP matrix before clustering
     S_std = StandardScaler().fit_transform(S_raw)
     _load_ideal()
     if not _IDEAL_CENTROIDS:

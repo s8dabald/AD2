@@ -1,11 +1,11 @@
 from sklearn.ensemble import IsolationForest
 import numpy as np
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, classification_report
-#load final feature matrix
+#prepare feature matrix
 def run_if(df, labels, verbose=False, seed=42):
     X_final = df.drop(columns= 'posting_id')
 
-    #setup isolation forest model
+    #configure isolation forest
     if_model = IsolationForest(
             n_estimators=1000,
             max_samples=400,
@@ -14,20 +14,20 @@ def run_if(df, labels, verbose=False, seed=42):
 
         )
 
-    #fit model on feature space
+    #fit on features
     if_model.fit(X_final)
 
-    #compute anomaly scores
+    #score anomalies
     scores = if_model.decision_function(X_final)
-    #flip sign so higher means more anomalous
+    #higher scores mean more anomalous
     anomaly_scores = -scores
 
-    #choose cutoff based on percentile
+    #use the 95th percentile cutoff
     threshold = np.percentile(anomaly_scores, 95)
-    #binary prediction from threshold
+    #convert scores to labels
     pred_labels = (anomaly_scores >= threshold).astype(int)
 
-    #evaluate against labels
+    #compare with stored labels
     precision = precision_score(labels, pred_labels)
     recall = recall_score(labels, pred_labels)
     f1 = f1_score(labels, pred_labels)
@@ -35,7 +35,7 @@ def run_if(df, labels, verbose=False, seed=42):
 
     tn, fp, fn, tp = confusion_matrix(labels, pred_labels).ravel()
 
-    # print results
+    #print metrics
     if verbose:
         print("Isolation Forest Evaluation:")
         print("Precision:", precision)

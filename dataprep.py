@@ -13,7 +13,7 @@ def preprocess_data(df):
 
     df['date_difference'] = (df['entered_date'] - df['document_date']).dt.days
 
-    # No NaN filling - if NaN exist, let it error so we can fix it
+    #let missing values fail so they can be fixed
     num_scaled = RobustScaler().fit_transform(df[numerical_features])
     num_scaled = MinMaxScaler().fit_transform(num_scaled)
     df[numerical_features] = num_scaled
@@ -37,7 +37,7 @@ def expand_group(group):
 
     for col in cols_expand:
         values = group[col].tolist()
-        values = values + [0] * (MAX_LEN - len(values))  # Padding mit 0
+        values = values + [0] * (MAX_LEN - len(values))  #pad with zeros
         for i in range(MAX_LEN):
             result[f"{col}_{i+1}"] = values[i]
 
@@ -64,18 +64,18 @@ def ohe_for_model(df_out):
         'weekend_1','weekend_2', 'weekend_3', 'nwh_1', 'nwh_2', 'nwh_3','top_n_1','top_n_2', 'top_n_3', 'high_cash_1', 'high_cash_2', 'high_cash_3'
         ]
 
-    # Alle in str konvertieren
+    #convert categories to strings
     for col in categorical_features:
         df_out[col] = df_out[col].astype(str)
 
-    # One-Hot
+    #one-hot encode categories
     ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
     encoded = ohe.fit_transform(df_out[categorical_features])
 
     encoded_df = pd.DataFrame(
         encoded,
         columns=ohe.get_feature_names_out(categorical_features),
-        index=df_out.index  # damit Reihenfolge passt
+        index=df_out.index  #keep source row order
     )
 
     df_final = pd.concat([df_out.drop(columns=categorical_features), encoded_df], axis=1)

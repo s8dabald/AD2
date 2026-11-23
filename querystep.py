@@ -26,7 +26,7 @@ def novelty_scores(df):
     knn.fit(X_scaled)
     distances, indices = knn.kneighbors(X_scaled)
 
-    # Remove self-neighbor
+    #remove the case itself
     novelty_raw = distances[:, 1:].mean(axis=1)
     novelty = (novelty_raw - novelty_raw.min()) / (novelty_raw.max() - novelty_raw.min() + 1e-12)
     return novelty
@@ -35,10 +35,22 @@ def novelty_uncertainty(df):
     df['novelty_uncertainty'] = novelty_scores(df)
     return df
 
-def uncertainty_query(df, strategy = "margin", exclude_posting_ids=None, novelty_scores=None):
+def uncertainty_query(df, strategy="margin", exclude_posting_ids=None,
+                     novelty_scores=None, random_scores=None, random_state=42):
     if exclude_posting_ids is None:
         exclude_posting_ids = []
-    if strategy == "margin":
+    if strategy == "random":
+        if random_scores is None:
+            random_scores = np.random.RandomState(random_state).random_sample(len(df))
+        random_scores = np.asarray(random_scores, dtype=float)
+        if len(random_scores) != len(df):
+            raise ValueError("random_scores must have one value per dataframe row")
+        eligible = np.flatnonzero(~df["posting_id"].isin(exclude_posting_ids).to_numpy())
+        if not len(eligible):
+            return df.iloc[0:0]
+        chosen = eligible[int(np.argmax(random_scores[eligible]))]
+        return df.iloc[[chosen]]
+    elif strategy == "margin":
         df = margin_uncertainty(df, df['pred_score'])
         filtered = df[~df['posting_id'].isin(exclude_posting_ids)]
         filtered = filtered.sort_values("margin_uncertainty", ascending=False).head(1)
@@ -56,3 +68,17 @@ def uncertainty_query(df, strategy = "margin", exclude_posting_ids=None, novelty
         filtered = df[~df['posting_id'].isin(exclude_posting_ids)]
         filtered = filtered.sort_values("novelty_uncertainty", ascending=False).head(1)
         return filtered.drop(columns=["novelty_uncertainty"])
+
+
+def select_batch(frame, excluded_ids, reviewed_ids, priority, tie_break, batch_size):
+    """Select deterministic highest-priority unreviewed batch, preserving canonical tie breaks."""
+    ids = frame["posting_id"].astype(str)
+    eligible = ~ids.isin(set(excluded_ids) | set(reviewed_ids)).to_numpy()
+    rows = np.flatnonzero(eligible)
+    priority = np.asarray(priority, dtype=float)
+    tie_break = np.asarray(tie_break, dtype=float)
+    order = rows[np.lexsort((tie_break[rows], -priority[rows]))]
+    chosen = order[:batch_size]
+    if len(chosen) != batch_size:
+        raise ValueError(f"Expected {batch_size} reviews, selected {len(chosen)}")
+    return ids.iloc[chosen].tolist()
